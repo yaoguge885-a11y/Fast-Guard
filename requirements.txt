@@ -1,0 +1,4 @@
+ultralytics
+PyQt5
+opencv-python
+numpy

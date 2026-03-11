@@ -1,0 +1,36 @@
+# 忽略 Python 缓存
+__pycache__/
+*.pyc
+
+# 忽略权重文件（建议手动拷贝或通过 LFS 传输）
+*.pt
+*.weights
+
+# 忽略测试视频和日志
+*.mp4
+*.avi
+runs/
+logs/
+
+# 忽略虚拟环境
+venv/
+.venv/
+
+# 打包文件（必须忽略，非常大且没必要上传）
+dist/
+build/
+*.exe
+*.spec
+
+# Python 缓存与环境
+__pycache__/
+.venv/
+venv/
+
+# YOLO 训练记录与权重
+runs/
+*.pt
+
+# 临时文档与乱码命名的文件（根据你的列表）
+*.docx
+*.pdf
