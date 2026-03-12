@@ -668,10 +668,14 @@ class VideoThread(QtCore.QThread):
 
         # Windows 常用字体：黑体、微软雅黑
         self.font_path = "C:/Windows/Fonts/simhei.ttf"
-        # 如果您的系统是 Linux/macOS，请修改为正确的字体路径，例如：
-        # self.font_path = "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"
-        # 或者将字体文件放在项目目录中，使用相对路径
-        # self.font_path = os.path.join(os.path.dirname(__file__), "fonts/simhei.ttf")
+        if not os.path.exists(self.font_path):
+            self.font_path = "C:/Windows/Fonts/msyh.ttc" # 备选微软雅黑
+        
+        self.cached_font = None
+        try:
+            self.cached_font = ImageFont.truetype(self.font_path, 24)
+        except Exception as e:
+            print(f"Font preload failed: {e}")
         # --------------------------------------
 
         # Class Name Translation Map
@@ -760,19 +764,36 @@ class VideoThread(QtCore.QThread):
 
     def _cv2_put_chinese(self, img, text, org, font_size, color):
         """
-        在 OpenCV 图像上绘制中文字符
+        单条绘制（作为兼容保留，但内部应优先使用批量绘制）
         """
+        return self._draw_batch_chinese(img, [(text, org, font_size, color)])
+
+    def _draw_batch_chinese(self, img, draws):
+        """
+        批量绘制中文字符，显著提升性能
+        draws: list of (text, org, font_size, color)
+        """
+        if not draws:
+            return img
+            
         img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        draw = ImageDraw.Draw(img_pil)
-        try:
-            font = ImageFont.truetype(self.font_path, font_size)
-        except Exception as e:
-            print(f"字体加载失败: {e}，使用默认字体")
-            font = ImageFont.load_default()
-        # 阴影
-        shadow_offset = (1, 1)
-        draw.text((org[0] + shadow_offset[0], org[1] + shadow_offset[1]), text, font=font, fill=(0, 0, 0))
-        draw.text(org, text, font=font, fill=color[::-1])  # BGR -> RGB
+        draw_obj = ImageDraw.Draw(img_pil)
+        
+        for text, org, font_size, color in draws:
+            try:
+                # 尽量复用字体对象，如果字号不同再重新加载
+                if self.cached_font and self.cached_font.size == font_size:
+                    font = self.cached_font
+                else:
+                    font = ImageFont.truetype(self.font_path, font_size)
+            except Exception:
+                font = ImageFont.load_default()
+            
+            # 阴影
+            shadow_offset = (1, 1)
+            draw_obj.text((org[0] + shadow_offset[0], org[1] + shadow_offset[1]), text, font=font, fill=(0, 0, 0))
+            draw_obj.text(org, text, font=font, fill=color[::-1]) # BGR -> RGB
+            
         return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
     def _draw_l_corners(self, frame, x1, y1, x2, y2, color, thickness=2, seg=16):
@@ -903,6 +924,12 @@ class VideoThread(QtCore.QThread):
         allowed_ids = {k for k, v in name_map.items() if v in allowed_names}
         fps_value = self.fps
 
+        # 检查 GPU 是否可用并指定设备
+        device = '0' if torch.cuda.is_available() else 'cpu'
+
+        # 缓存上一帧的追踪结果
+        last_results = None
+        deferred_draws = []
         while self._running:
             if self._user_paused and not self._seeking:
                 time.sleep(0.05)
@@ -929,50 +956,32 @@ class VideoThread(QtCore.QThread):
             frame_raw = frame.copy()
 
 
-            # --- 核心图像预处理（论文建议）---
-            # 1) 平滑降噪：中值滤波，抑制规则纹理与椒盐噪声
-            #    说明：本地前处理主要做噪声抑制和对比度增强；若要在模型侧引入
-            #    “坐标注意力 CA + 深度可分离卷积”，可在 backbone 低层插入 CA_Block
-            #    （见 ca_demo.py），提升非机动车位置感知并降低背景大楼干扰。
-            denoised_frame = cv2.medianBlur(frame, 3)
+            # --- 优化后的图像预处理 ---
+            # 只有当需要显示预处理视图时，才进行所有昂贵的计算
+            # 默认只进行最小限度的增强用于推理
+            
+            # 推理用的轻量级增强
+            inference_frame = frame
+            pre_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) # 基础灰度用于后续逻辑
 
-            # 2) 光照校正 + 对比度增强：在 LAB 的 L 通道做 CLAHE
-            lab = cv2.cvtColor(denoised_frame, cv2.COLOR_BGR2LAB)
-            l, a, b = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            l_eq = clahe.apply(l)
-            enhanced_frame = cv2.cvtColor(cv2.merge((l_eq, a, b)), cv2.COLOR_LAB2BGR)
+            # 如果需要更强的特征（原有的 CLAHE 和 掩码），可以保留但优化
+            # 比如：每 2 帧计算一次掩码，或者跳过 Sobel
+            do_heavy_preproc = (self._frame_count % 3 == 0) # 降低重度预处理频率
+            
+            if do_heavy_preproc:
+                denoised_frame = cv2.medianBlur(frame, 3)
+                lab = cv2.cvtColor(denoised_frame, cv2.COLOR_BGR2LAB)
+                l, a, b = cv2.split(lab)
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                l_eq = clahe.apply(l)
+                enhanced_frame = cv2.cvtColor(cv2.merge((l_eq, a, b)), cv2.COLOR_LAB2BGR)
+                pre_gray = l_eq # 更新显示用的灰度图
+            else:
+                enhanced_frame = frame
 
-            # 3) 灰度化（用于边缘与掩码分割，不直接替代 YOLO 彩色输入）
-            gray_frame = cv2.cvtColor(enhanced_frame, cv2.COLOR_BGR2GRAY)
-
-            # 4) Sobel 边缘辅助特征（用于弱目标过滤/调试，不直接喂模型）
-            sobel_x = cv2.Sobel(gray_frame, cv2.CV_32F, 1, 0, ksize=3)
-            sobel_y = cv2.Sobel(gray_frame, cv2.CV_32F, 0, 1, ksize=3)
-            sobel_magnitude = cv2.magnitude(sobel_x, sobel_y)
-            sobel_magnitude = cv2.normalize(sobel_magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-            # 5) Otsu 掩码分割
-            blur_for_thresh = cv2.GaussianBlur(gray_frame, (5, 5), 0)
-            _, binary_mask = cv2.threshold(blur_for_thresh, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-            # 6) 形态学处理：先膨胀再腐蚀，连接断裂区域并去除碎噪
-            morph_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-            dilated_mask = cv2.dilate(binary_mask, morph_kernel, iterations=1)
-            refined_mask = cv2.erode(dilated_mask, morph_kernel, iterations=1)
-
-            # 使用形态学掩码抑制背景干扰，同时保留场景上下文
-            foreground = cv2.bitwise_and(enhanced_frame, enhanced_frame, mask=refined_mask)
-            background = cv2.bitwise_and(enhanced_frame, enhanced_frame, mask=cv2.bitwise_not(refined_mask))
-            inference_frame = cv2.addWeighted(foreground, 1.0, background, 0.35, 0)
-
-            # 供后续分析/调试的边缘密度特征
-            edge_density = float(np.sum(sobel_magnitude > 50) / max(h * w, 1))
-
-            # 显示帧使用原图与增强图的轻微融合，保持自然观感
-            frame = cv2.addWeighted(frame_raw, 0.65, enhanced_frame, 0.35, 0)
-            # 预处理画面使用灰度结果
-            pre_gray = gray_frame
+            # 简化掩码和推理帧生成 (核心卡顿点)
+            inference_frame = enhanced_frame
+            sobel_magnitude = np.zeros_like(pre_gray) # 默认空，按需计算
 
             # --- 双目 SBS 自动识别与分割 ---
 
@@ -1041,33 +1050,38 @@ class VideoThread(QtCore.QThread):
             warning_line_small_y = int(h * 0.88)
             detect_line_y = int(h * 0.40)
 
+            # 仅前向视角绘制警示线/渐变；侧向不画红/灰线
+            if self.current_perspective == "前向视角":
+                grad_region = frame[warning_line_y:, :, :].astype(np.float32)
+                red = np.zeros_like(grad_region)
+                red[:, :, 2] = 255
+                if grad_region.shape[0] > 0:
+                    alpha = np.linspace(0.0, 0.35, grad_region.shape[0], dtype=np.float32)[:, None, None]
+                    blended = grad_region * (1 - alpha) + red * alpha
+                    frame[warning_line_y:, :, :] = blended.astype(np.uint8)
 
-            # 渐变警示区（透明->半透明红）
-            grad_region = frame[warning_line_y:, :, :].astype(np.float32)
-            red = np.zeros_like(grad_region)
-            red[:, :, 2] = 255
-            if grad_region.shape[0] > 0:
-                alpha = np.linspace(0.0, 0.35, grad_region.shape[0], dtype=np.float32)[:, None, None]
-                blended = grad_region * (1 - alpha) + red * alpha
-                frame[warning_line_y:, :, :] = blended.astype(np.uint8)
-
-            for x in range(0, w, 30):
-                cv2.line(frame, (x, warning_line_y), (min(x + 18, w - 1), warning_line_y), (0, 0, 255), 4)
-            for x in range(0, w, 30):
-                cv2.line(frame, (x, detect_line_y), (min(x + 16, w - 1), detect_line_y), (160, 160, 160), 2)
+                for x in range(0, w, 30):
+                    cv2.line(frame, (x, warning_line_y), (min(x + 18, w - 1), warning_line_y), (0, 0, 255), 4)
+                for x in range(0, w, 30):
+                    cv2.line(frame, (x, detect_line_y), (min(x + 16, w - 1), detect_line_y), (160, 160, 160), 2)
 
 
-            results = model.track(
-                inference_frame,
-                persist=True,
-                verbose=False,
-                imgsz=800,          # 降低输入分辨率以提升速度（原 1024）
-                conf=0.25,
-                iou=0.5,
-                classes=[0, 1, 2, 3, 5, 7],
-                vid_stride=2,       # 跳帧推理，性能优先（原 1）
-                tracker="bytetrack.yaml",
-            )
+            # 实跳帧逻辑：每 2 帧进行一次推理
+            if self._frame_count % 2 == 0:
+                results = model.track(
+                    inference_frame,
+                    persist=True,
+                    verbose=False,
+                    imgsz=640,          # 进一步降低分辨率以提升速度 (640 是 YOLO 标准值)
+                    conf=0.25,
+                    iou=0.5,
+                    classes=[0, 1, 2, 3, 5, 7],
+                    tracker="bytetrack.yaml",
+                    device=device       # 明确使用 GPU
+                )
+                last_results = results
+            else:
+                results = last_results
 
             infos = []
             persons = []
@@ -1191,12 +1205,13 @@ class VideoThread(QtCore.QThread):
             view_text = self.current_perspective
             if self.perspective_locked:
                 view_text += " (已锁定)"
-            frame = self._cv2_put_chinese(frame, view_text, (w - 360, 40), 32, (255, 255, 255))
+            deferred_draws.append((view_text, (w - 360, 40), 32, (255, 255, 255)))
 
             # 根据视角类型选择不同的碰撞检测逻辑
-            if self.current_perspective == "侧面视角" and self.side_detector:
-                frame = self._process_side_collision(frame, infos, w, h)
+            if self.current_perspective == "侧面视角":
+                frame = self._process_side_ipm(frame, infos, w, h, fps_value, deferred_draws)
             elif self.current_perspective == "前向视角":
+
                 min_ttc_alert = 99.0
                 min_id_alert = -1
                 
@@ -1224,7 +1239,6 @@ class VideoThread(QtCore.QThread):
                                 obj_dist = (self.focal_length * self.baseline) / avg_disp
                     else:
                         # 单目近似距离：使用检测框高度估距（假设目标高度常数 H_obj）
-                        # d ~ (H_obj * f) / bbox_height ；此处 f 取 focal_length，H_obj 取类均值
                         H_obj_map = {
                             "car": 1.5,
                             "truck": 2.5,
@@ -1267,10 +1281,6 @@ class VideoThread(QtCore.QThread):
                         d_safe=self.d_safe,
                     )
 
-                    
-                    # === 安全距离阈值 SDT (论文 2.3) ===
-                    # V_rel：利用距离帧差估计相对速度；SDT = V_rel * T_reaction + d_safe
-                    # 条件 A: D < SDT；条件 B: 正在靠近 (v_rel>0 且 TTC>0)。A&B → 二级红色预警
                     v_rel = None
                     sdt_violation = False
                     safe_dist = None
@@ -1278,31 +1288,25 @@ class VideoThread(QtCore.QThread):
                     if obj_dist is not None:
 
                         prev_dist = self._last_distance.get(track_id)
-                        # 自适应反应时间：侧向 0.8s，前向 1.2s
                         t_react_use = 0.8 if self.current_perspective == "侧面视角" else self.t_reaction
 
                         if prev_dist is not None:
                             v_rel = (prev_dist - obj_dist) * fps_value  # m/s，正值代表在接近
-                            # 速度平滑/连续接近：记录最近 6 帧，仅当连续>=5帧 v_rel>0 才允许 SDT
                             hist = self._vrel_history.get(track_id, [])
                             hist = (hist + [v_rel])[-6:]
                             self._vrel_history[track_id] = hist
                             continuous_closing = len(hist) >= 5 and all(v > 0 for v in hist[-5:])
 
                             safe_dist = v_rel * t_react_use + self.d_safe
-                            # 侧向误报抑制：收窄车道中心范围，仅对车辆/车道内目标启用 SDT
                             lane_center_ok = (w * 0.35) <= cx <= (w * 0.65)
                             is_vehicle = class_name in {"car", "truck", "bus"}
                             v_rel_avg = sum(hist[-5:]) / 5.0 if len(hist) >= 5 else v_rel
                             sdt_gate = (lane_center_ok or is_vehicle) and continuous_closing and (v_rel_avg is not None and v_rel_avg > 0.5)
 
-                            # 横向位移过滤：若横向速度远大于纵向扩张速度，则认为主要是横移，不触发 SDT
                             lateral_only = vx_abs > (abs(vw) + 1e-3) * 1.5
-                            # 近线约束：只有接近红线（前车/主车道）才触发 SDT
                             near_line = y2 > warning_line_y
 
                             if sdt_gate and near_line and not lateral_only and v_rel is not None and v_rel > 1.0 and ttc > 0 and obj_dist < safe_dist:
-                                # 高度限制过滤：远景/高 y 线稳定的目标不触发 SDT 贡献
                                 prev_center = self._last_centers.get(track_id)
                                 cy_prev = prev_center[1] if prev_center else cy
                                 if abs(cy - cy_prev) < 1.0 and cy < h * 0.4:
@@ -1330,10 +1334,6 @@ class VideoThread(QtCore.QThread):
                     if is_static:
                         continue
 
-                    # 横向速度绝对值
-                    # 已用于 SDT，仍保留给后续横向过滤
-                    # vx_abs 前面已定义
-
                     ratio = vx_abs / max(vw, 1e-3)
                     center_relaxed = (w * 0.35) <= cx <= (w * 0.65)
                     ratio_threshold = 0.9 if center_relaxed else 0.9
@@ -1350,7 +1350,6 @@ class VideoThread(QtCore.QThread):
                     elif ttc < 1.5 and not red_ok:
                         warn_ttc = 1.5
 
-                    # SDT 告警优先级：若满足 A&B，直接二级红色（更严格的距离约束）
                     sdt_tag = False
                     if sdt_violation:
                         sdt_tag = True
@@ -1360,7 +1359,7 @@ class VideoThread(QtCore.QThread):
                         min_ttc_alert = warn_ttc
                         min_id_alert = track_id
 
-                    # 前向视角显示（中文），基于风险等级覆盖颜色
+                    # 前向视角显示参数
                     color, label, thickness = self._get_forward_display_params(
                         track_id, class_name, ttc, y2, warn_line, lateral_fast, red_ok
                     )
@@ -1371,23 +1370,19 @@ class VideoThread(QtCore.QThread):
                         color = (0, 255, 255)
                         thickness = max(thickness, 2)
 
-                    # SDT 告警优先级：若触发则标记 SDT 信息
                     if sdt_tag:
                         if safe_dist is not None:
                             label = f"SDT {safe_dist:.1f}m"
                         else:
                             label = label.replace("TTC", "SDT") if "TTC" in label else f"SDT {label}"
-                    # 标签增强：距离/相对速度信息
                     if obj_dist is not None:
                         label += f" {obj_dist:.1f}m"
                     if v_rel is not None:
                         label += f" v={v_rel:.1f}m/s"
                     
                     self._draw_l_corners(frame, x1, y1, x2, y2, color, thickness=thickness, seg=18)
-
-                    # 标签（全部使用中文绘制）
-                    frame = self._cv2_put_chinese(frame, label, (x1, y1 - 35), 24, color)
-
+                    # 延迟绘制标签
+                    deferred_draws.append((label, (x1, y1 - 35), 24, color))
 
                 if min_ttc_alert < 1.5:
                     if self._frame_count % 2 == 0:
@@ -1403,6 +1398,10 @@ class VideoThread(QtCore.QThread):
             }
             self.hud_signal.emit(hud_payload)
 
+            # 5. 批量执行中文绘制 (核心优化)
+            if deferred_draws:
+                frame = self._draw_batch_chinese(frame, deferred_draws)
+                deferred_draws = []
 
             # 1. Original View (frame_raw)
             rgb_orig = cv2.cvtColor(frame_raw, cv2.COLOR_BGR2RGB)
@@ -1449,70 +1448,136 @@ class VideoThread(QtCore.QThread):
         self.status_signal.emit("系统就绪")
 
 
-    def _process_side_collision(self, frame, infos, w, h):
-        """处理侧向碰撞检测（中文标签）"""
-        # 已彻底移除区域绘制
+    def _process_side_ipm(self, frame, infos, w, h, fps_value, deferred_draws):
+        """侧向视角：基于 0.8m 碰撞壁垒的开门/侧侵预警"""
+        # 侧向敏感区：X 0~0.8m（贴车身），Y -2~10m（前 2m 至后 10m）
+        roi_rect = [(0.0, -2.0), (0.8, -2.0), (0.8, 10.0), (0.0, 10.0)]
+
+        wall_samples = []
+        car_edge_samples = []
+
+        if self.ipm:
+            # 绘制敏感区梯形
+            pts_roi = []
+            for X, Y in roi_rect:
+                pt = self.ipm.ground_to_pixel(X, Y, (h, w))
+                if pt:
+                    pts_roi.append(pt)
+            if len(pts_roi) >= 3:
+                poly = np.array(pts_roi, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(frame, [poly], isClosed=True, color=(200, 180, 90), thickness=2, lineType=cv2.LINE_AA)
+
+            # 侧向碰撞壁垒：x=0.8m（右上至左下方向的虚线）
+            wall_pts = []
+            car_pts = []
+            for Y in np.linspace(-2.0, 10.0, 18):
+                pt_wall = self.ipm.ground_to_pixel(0.8, Y, (h, w))
+                pt_car = self.ipm.ground_to_pixel(0.0, Y, (h, w))
+                if pt_wall:
+                    wall_pts.append(pt_wall)
+                if pt_car:
+                    car_pts.append(pt_car)
+            wall_samples = wall_pts
+            car_edge_samples = car_pts
+
+            if len(wall_pts) >= 2:
+                wall_pts_sorted = sorted(wall_pts, key=lambda p: p[1], reverse=True)
+                for i in range(0, len(wall_pts_sorted) - 1, 2):
+                    cv2.line(frame, wall_pts_sorted[i], wall_pts_sorted[i + 1], (240, 200, 0), 2, lineType=cv2.LINE_AA)
+
+        def _interp_x(points, y):
+            if not points:
+                return None
+            pts = sorted(points, key=lambda p: p[1])
+            if y <= pts[0][1]:
+                return pts[0][0]
+            if y >= pts[-1][1]:
+                return pts[-1][0]
+            for i in range(len(pts) - 1):
+                y0, y1 = pts[i][1], pts[i + 1][1]
+                if y0 <= y <= y1:
+                    ratio = (y - y0) / max(y1 - y0, 1e-6)
+                    return pts[i][0] + ratio * (pts[i + 1][0] - pts[i][0])
+            return None
+
+        non_warning_band = int(w * 0.33)
 
         for track_id, x1, y1, x2, y2, cx, cy, class_name in infos:
-            bbox = (x1, y1, x2, y2)
-            confidence = 0.5
-            self.side_detector.update_object_tracking(track_id, bbox, class_name, confidence)
+            # 仅使用检测框最右边缘（x_max, y_max）作为锚点，禁止中心点
+            anchor_u, anchor_v = x2, y2
 
-            obj_info = self.side_detector.side_objects.get(track_id)
-            if obj_info:
-                warning_level = obj_info.get('warning_level', 0)
-                
-                chinese_class = self.class_map.get(class_name, class_name)
+            world_pos = None
+            if self.ipm:
+                world_pos = self.ipm.pixel_to_ground(anchor_u, anchor_v, (h, w))
+                if world_pos is not None:
+                    self._update_world_track(track_id, world_pos, max_len=20)
 
-                if warning_level >= 3:
-                    color = (0, 0, 255)          # 红
-                    label = f"{chinese_class} 危险！"
-                    thickness = 3
-                elif warning_level >= 2:
-                    color = (0, 165, 255)        # 橙
-                    label = f"{chinese_class} 接近中"
-                    thickness = 2
-                elif warning_level >= 1:
-                    color = (0, 255, 255)        # 黄
-                    label = f"{chinese_class}"
-                    thickness = 2
+            closure_x = 0.0
+            distance_x = None
+            distance_y = None
+            if world_pos is not None:
+                history = self._world_history.get(track_id, [])
+                distance_x = abs(world_pos[0])
+                distance_y = world_pos[1]
+                if len(history) >= 2:
+                    prev = history[-2]
+                    curr = history[-1]
+                    closure_x = (abs(prev[0]) - abs(curr[0])) * fps_value
+
+            # 基于 0.8m 物理墙 + 像素阈线（倾斜虚线）双重判断
+            wall_x = _interp_x(wall_samples, anchor_v)
+            car_x = _interp_x(car_edge_samples, anchor_v)
+            inside_by_pixel = False
+            if wall_x is not None and anchor_u >= non_warning_band:
+                if car_x is not None:
+                    inside_by_pixel = anchor_u >= wall_x if car_x >= wall_x else anchor_u <= wall_x
                 else:
-                    color = (0, 255, 0)          # 绿
-                    label = f"{chinese_class}"
-                    thickness = 1
+                    inside_by_pixel = anchor_u >= wall_x
 
-                self._draw_l_corners(frame, x1, y1, x2, y2, color, thickness=2, seg=18)
-                frame = self._cv2_put_chinese(frame, label, (x1, y1 - 35), 24, color) # Font size 24
+            inside_by_world = distance_x is not None and distance_x < 0.8
 
+            far_enough = (distance_x is not None and distance_x >= 1.2) or (distance_x is None and anchor_u < non_warning_band)
+            pixel_trigger = inside_by_pixel and not far_enough
+            inside_wall = inside_by_world or pixel_trigger
 
-                # 运动方向箭头（中文符号）
-                if 'lateral_speed' in obj_info:
-                    speed = obj_info['lateral_speed']
-                    if abs(speed) > 5:
-                        direction = "←" if speed < 0 else "→"
-                        frame = self._cv2_put_chinese(frame, direction, (x2 + 10, cy - 15), 32, (255, 255, 255)) # Font size 32
+            chinese_class = self.class_map.get(class_name, class_name)
+            label = chinese_class
+            color = (0, 255, 0)
+            thickness = 2
 
-        warnings = self.side_detector.analyze_collision_risk()
-        for warning in warnings:
-            level = warning['level']
-            message = warning['message']
-            obj_id = warning['object_id']
+            vulnerable = class_name in {"bicycle", "motorcycle", "person"}
+            blink = (self._frame_count % 4) < 2
 
-            self.side_warning_signal.emit(level, message, obj_id)
-
-            warning_y = 60 + len(warnings) * 35 # Adjust spacing for larger font
-            if level == 'danger':
-                color = (0, 0, 255)
-            elif level == 'warning' or level == 'door_danger':
-                color = (0, 165, 255)
-            elif level == 'alert':
-                color = (0, 255, 255)
+            if far_enough:
+                label = f"安全 {distance_x:.2f}m" if distance_x is not None else chinese_class
+            elif inside_wall:
+                if vulnerable:
+                    color = (0, 0, 255) if blink else (0, 0, 120)
+                    thickness = 3
+                    label = f"近场开门警告 {distance_x:.2f}m" if distance_x is not None else "近场开门警告"
+                else:
+                    color = (0, 0, 255)
+                    thickness = 3
+                    label = f"碰撞壁垒内 {distance_x:.2f}m" if distance_x is not None else "碰撞壁垒内"
+                self.side_warning_signal.emit('danger', label, track_id)
             else:
-                color = (255, 255, 255)
-            # 使用中文绘制警告消息
-            frame = self._cv2_put_chinese(frame, message, (20, warning_y), 28, color) # Font size 28
+                if closure_x > 0.3 and distance_x is not None and distance_x < 1.2:
+                    color = (0, 165, 255)
+                    thickness = 2
+                    label = f"靠近 {distance_x:.2f}m"
+                    self.side_warning_signal.emit('warning', label, track_id)
+                else:
+                    label = f"平行 {distance_x:.2f}m" if distance_x is not None else chinese_class
+
+            self._draw_l_corners(frame, x1, y1, x2, y2, color, thickness=2, seg=18)
+            deferred_draws.append((label, (x1, y1 - 35), 24, color))
+
 
         return frame
+
+
+
+
 
     def _get_forward_display_params(self, track_id, class_name, ttc, y2, warn_line, lateral_fast, red_ok):
         """获取前向视角显示参数（中文）"""
