@@ -85,3 +85,47 @@ class IPM_Transformer:
         X = x2 * t
         Y = z2 * t
         return X, Y
+
+    def ground_to_pixel(self, X: float, Y: float, frame_shape: Tuple[int, int]) -> Optional[Tuple[float, float]]:
+        """
+        将地平面坐标 (X, Y) 映射到像素坐标 (u, v)。
+        返回 None 表示无法映射。
+        """
+        h, w = frame_shape
+        if self.frame_w != w or self.frame_h != h:
+            self.set_frame(w, h)
+
+        if any(x is None for x in [self.fx, self.fy, self.cx, self.cy]):
+            return None
+
+        # 地平面点到相机坐标的射线方向
+        # 相机位置为 (0, self.cam_height, 0)，地平面点为 (X, 0, Y)
+        x_dir = X
+        y_dir = -self.cam_height  # 相机到地面的垂直距离
+        z_dir = Y
+
+        # 偏航和俯仰的逆旋转
+        cp, sp = math.cos(self.pitch), math.sin(self.pitch)
+        cyaw, syaw = math.cos(self.yaw), math.sin(self.yaw)
+
+        # 先逆绕 Y（偏航）
+        x1 = cyaw * x_dir - syaw * z_dir
+        z1 = syaw * x_dir + cyaw * z_dir
+        y1 = y_dir
+        # 再逆绕 X（俯仰）
+        y2 = cp * y1 + sp * z1
+        z2 = -sp * y1 + cp * z1
+        x2 = x1
+
+        # 归一化相机坐标
+        if z2 <= 1e-6:
+            return None  # 射线与相机平面平行或指向后方
+
+        x_cam = x2 / z2
+        y_cam = y2 / z2
+
+        # 相机坐标到像素坐标
+        u = self.fx * x_cam + self.cx
+        v = self.fy * y_cam + self.cy
+
+        return u, v
