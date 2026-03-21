@@ -64,11 +64,12 @@ class TTCCalculator:
         xs.append(float(center_x))
         ys.append(float(center_y))
 
+        # 不再使用像素触底/横向统一触发线，始终按面积阈值启用
         area_ok = area_ratio >= float(min_area_ratio)
-        redline_cross = bottom_y > warning_line_y
-        red_allowed = area_ok and redline_cross
+        red_allowed = area_ok
         # 横向安全走廊（收窄车道范围，过滤路侧/偏离目标）
         in_path = (frame_w * 0.35) <= center_x <= (frame_w * 0.65)
+
 
         ttc = self.safe_ttc
 
