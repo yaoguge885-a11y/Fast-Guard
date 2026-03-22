@@ -6,6 +6,23 @@ import sys
 import time
 import math
 import shutil
+import logging
+
+# 设置全局系统日志记录器
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_TIMESTAMP = time.strftime('%Y%m%d_%H%M%S')
+LOG_FILE = os.path.join(LOG_DIR, f'system_log_{LOG_TIMESTAMP}.log')
+
+SYSTEM_LOGGER = logging.getLogger(f'System_{LOG_TIMESTAMP}')
+SYSTEM_LOGGER.setLevel(logging.DEBUG)
+SYSTEM_LOGGER.handlers = []
+fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
+fh.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S')
+fh.setFormatter(formatter)
+SYSTEM_LOGGER.addHandler(fh)
+SYSTEM_LOGGER.info(f"系统启动，日志文件：{LOG_FILE}")
 
 import ultralytics
 import cv2
@@ -696,6 +713,10 @@ class VideoThread(QtCore.QThread):
         self.model_name = os.path.basename(model_path)
         self.weak_conf_threshold = float(weak_conf_threshold)
         self.edge_strength_threshold = float(edge_strength_threshold)
+        
+        # 使用全局日志记录器
+        SYSTEM_LOGGER.info(f"VideoThread | 视频：{self.source} | 模型：{self.model_name}")
+        
         self._running = True
         self._frame_count = 0
         self._last_centers = {}
@@ -2971,15 +2992,17 @@ class MainWindow(QtWidgets.QWidget):
     def update_side_warning(self, level, message, object_id):
         self.side_warning_timer.start(3000)
         timestamp = time.strftime("%H:%M:%S")
-        
+
         prefix = "⚠️ "
         if level == 'danger': prefix = "🚨 "
-        
-        self.log_window.append_log(f"{prefix} [{timestamp}] {message}")
-        
+
+        log_msg = f"{prefix} [{timestamp}] {message}"
+        self.log_window.append_log(log_msg)
+        SYSTEM_LOGGER.info(log_msg)
+
         self.card_risk.update_value("侧向预警", message)
         self.card_risk.setStyleSheet("""
-            QFrame#statCard { background: #431407; border: 1px solid #d97706; border-radius: 16px; } 
+            QFrame#statCard { background: #431407; border: 1px solid #d97706; border-radius: 16px; }
             QLabel {background: transparent;}
         """)
 
@@ -2990,11 +3013,15 @@ class MainWindow(QtWidgets.QWidget):
 
     def append_log(self, track_id, ttc):
         timestamp = time.strftime("%H:%M:%S")
-        self.log_window.append_log(f"⚡ [{timestamp}] ID:{track_id} TTC:{ttc:.1f}s")
+        log_msg = f"⚡ [{timestamp}] ID:{track_id} TTC:{ttc:.1f}s"
+        self.log_window.append_log(log_msg)
+        SYSTEM_LOGGER.info(log_msg)
 
     def append_system_log(self, message):
         timestamp = time.strftime("%H:%M:%S")
-        self.log_window.append_log(f"ℹ️ [{timestamp}] {message}")
+        log_msg = f"ℹ️ [{timestamp}] {message}"
+        self.log_window.append_log(log_msg)
+        SYSTEM_LOGGER.info(log_msg)
 
     def update_model_name(self, name):
 

@@ -5,6 +5,7 @@ import sys
 import time
 import math
 import shutil
+import logging
 
 import ultralytics
 import cv2
@@ -17,6 +18,28 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont   # 新增：PIL 中文支持
+
+# 设置系统日志记录器
+def setup_logger():
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    log_file = os.path.join(log_dir, f'ui_log_{timestamp}.log')
+    
+    logger = logging.getLogger(f'UI_{timestamp}')
+    logger.setLevel(logging.DEBUG)
+    logger.handlers = []
+    
+    fh = logging.FileHandler(log_file, encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S')
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    
+    return logger, log_file
+
+system_logger, system_log_file = setup_logger()
+system_logger.info(f"UI系统启动，日志文件：{system_log_file}")
 
 def print_versions():
     print(f"Python 版本: {sys.version}")
@@ -1189,11 +1212,13 @@ class MainWindow(QtWidgets.QWidget):
     def update_side_warning(self, level, message, object_id):
         self.side_warning_timer.start(3000)
         timestamp = time.strftime("%H:%M:%S")
-        
+
         prefix = "⚠️ "
         if level == 'danger': prefix = "🚨 "
-        
-        self.log_window.append_log(f"{prefix} [{timestamp}] {message}")
+
+        log_msg = f"{prefix} [{timestamp}] {message}"
+        self.log_window.append_log(log_msg)
+        system_logger.info(log_msg)
         
         self.card_risk.update_value("侧向预警", message)
         self.card_risk.setStyleSheet("""
@@ -1208,11 +1233,15 @@ class MainWindow(QtWidgets.QWidget):
 
     def append_log(self, track_id, ttc):
         timestamp = time.strftime("%H:%M:%S")
-        self.log_window.append_log(f"⚡ [{timestamp}] ID:{track_id} TTC:{ttc:.1f}s")
+        log_msg = f"⚡ [{timestamp}] ID:{track_id} TTC:{ttc:.1f}s"
+        self.log_window.append_log(log_msg)
+        system_logger.info(log_msg)
 
     def append_system_log(self, message):
         timestamp = time.strftime("%H:%M:%S")
-        self.log_window.append_log(f"ℹ️ [{timestamp}] {message}")
+        log_msg = f"ℹ️ [{timestamp}] {message}"
+        self.log_window.append_log(log_msg)
+        system_logger.info(log_msg)
 
     def update_model_name(self, name):
 

@@ -9,7 +9,10 @@
 
 import cv2
 import numpy as np
+import logging
 from collections import deque
+from datetime import datetime
+import os
 
 
 class ViewClassifier:
@@ -17,6 +20,42 @@ class ViewClassifier:
     
     def __init__(self):
         self.reset()
+        self.setup_logger()
+    
+    def setup_logger(self):
+        """设置日志记录器"""
+        # 创建 logs 目录
+        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # 生成日志文件名（使用日期时间）
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_file = os.path.join(log_dir, f'view_classifier_{timestamp}.log')
+        
+        # 配置日志
+        self.logger = logging.getLogger('ViewClassifier')
+        self.logger.setLevel(logging.DEBUG)
+        
+        # 清除已有的 handler
+        self.logger.handlers = []
+        
+        # 文件 handler（使用缓冲，减少 I/O 次数）
+        file_handler = logging.FileHandler(log_file, encoding='utf-8', mode='a')
+        file_handler.setLevel(logging.DEBUG)
+        
+        # 控制台 handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        
+        # 格式
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+        file_handler.setFormatter(formatter)
+        console_handler.setFormatter(formatter)
+        
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(console_handler)
+        
+        self.logger.info(f"视角分类器启动，日志文件：{log_file}")
     
     def reset(self):
         """重置分类器状态"""
@@ -60,6 +99,12 @@ class ViewClassifier:
         
         # 防止计数器溢出
         self.max_frame_count = 10000
+        
+        # 清理日志 handler（防止重复）
+        if hasattr(self, 'logger') and self.logger:
+            for handler in self.logger.handlers[:]:
+                handler.close()
+                self.logger.removeHandler(handler)
     
     def _preprocess(self, frame):
         """预处理：降采样 + 转灰度图（性能优化）"""
@@ -163,8 +208,9 @@ class ViewClassifier:
         else:
             self.front_lock_counter = 0
         
-        # 每次检测都打印（方便调试）
-        print(f"[物理锚点] 左侧 MSE: {self.left_mse:.2f} {'(静止)' if self.left_static else ''} | 右侧 MSE: {self.right_mse:.2f} {'(静止)' if self.right_static else ''} | 侧向={is_side_view} | 前向计数：{self.front_lock_counter}")
+        # 减少日志频率（每 10 次检测记录一次）
+        if self.frame_count % (self.check_interval * 10) == 0:
+            self.logger.debug(f"左侧 MSE: {self.left_mse:.2f} {'(静止)' if self.left_static else ''} | 右侧 MSE: {self.right_mse:.2f} {'(静止)' if self.right_static else ''} | 侧向={is_side_view} | 前向计数：{self.front_lock_counter}")
         
         return is_side_view, side_anchor, self.left_static, self.right_static, self.left_mse, self.right_mse
     
@@ -208,7 +254,7 @@ class ViewClassifier:
                 # 额外检查：两侧 MSE 都必须非常低
                 both_very_static = self.left_mse < 10.0 and self.right_mse < 10.0
                 if self.side_lock_counter >= 10 and both_very_static:
-                    print(f"[视角状态锁] 确认侧向视角，连续{self.side_lock_counter}帧，MSE: L={self.left_mse:.1f}, R={self.right_mse:.1f}")
+                    self.logger.warning(f"确认侧向视角，连续{self.side_lock_counter}帧，MSE: L={self.left_mse:.1f}, R={self.right_mse:.1f}")
                     self.current_view = "侧面视角"
                 else:
                     # 保持前向视角
@@ -219,7 +265,7 @@ class ViewClassifier:
                 # 需要连续 30 帧前向才能解锁
                 self.side_lock_counter += 1
                 if self.side_lock_counter >= self.required_unlock_frames:
-                    print(f"[视角状态锁] 连续{self.side_lock_counter}帧前向，解锁切回前向视角")
+                    self.logger.info(f"连续{self.side_lock_counter}帧前向，解锁切回前向视角")
                     self.current_view = "前向视角"
                     self.side_lock_counter = 0
                 else:
