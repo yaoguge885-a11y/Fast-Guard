@@ -53,8 +53,8 @@ class SideDetectorConfig:
     monitor_x_max: float = 6.0       # 横向监控范围（单侧，米）
     
     # BSD（盲区检测）参数
-    bsd_distance: float = 3.5        # 盲区范围（米）
-    bsd_warning_distance: float = 1.5 # 盲区警告距离（米）
+    bsd_distance: float = 5.0        # 盲区范围（米），增加到5米
+    bsd_warning_distance: float = 2.0 # 盲区警告距离（米），增加到2米
     
     # TTL（侧向侵入时间）参数
     ttl_danger_threshold: float = 1.0 # TTL 危险阈值（秒）
@@ -77,13 +77,18 @@ class SideDetectorConfig:
     static_frames: int = 8            # 静态判定帧数
     
     # 报警连续帧阈值
-    min_alarm_frames: int = 6         # 连续报警帧数阈值，只有连续满足报警条件达到此帧数才输出报警
+    min_alarm_frames: int = 3         # 连续报警帧数阈值，只有连续满足报警条件达到此帧数才输出报警
     
     # 车体偏移补偿
     body_offset: float = 1.0         # 车体宽度偏移（米），让 X=0 代表车身边缘而非镜头中心线
     
     # 极近距离参数
     critical_distance: float = 1.2  # 极近距离阈值（米），低于此距离无视速度判定
+    
+    # 贴身车辆检测参数
+    immediate_alarm_distance: float = 1.5  # 小于此距离立即报警，无视连续帧阈值
+    monitor_y_min_close: float = -5.0      # 贴身车辆的Y轴监控范围（更宽松）
+    monitor_y_max_close: float = 10.0
 
 
 class SideCollisionDetector:
@@ -209,8 +214,8 @@ class SideCollisionDetector:
         else:
             vx_smooth = vx
         
-        # 判断是否在监控区域
-        in_monitor_zone = self._is_in_monitor_zone(x_smooth, y)
+        # 判断是否在监控区域（传入distance_x用于贴身车辆检测）
+        in_monitor_zone = self._is_in_monitor_zone(x_smooth, y, distance_x)
         
         if not in_monitor_zone:
             return None
@@ -248,8 +253,11 @@ class SideCollisionDetector:
         elif raw_risk_level > 0:
             # 满足报警条件（黄色预警），计数器加1
             self._alarm_counters[track_id] = self._alarm_counters.get(track_id, 0) + 1
+            # 贴身车辆（distance_x < immediate_alarm_distance）立即报警，不等待连续帧
+            if distance_x < cfg.immediate_alarm_distance:
+                risk_level = raw_risk_level
             # 只有连续帧数达到阈值才输出真正的报警
-            if self._alarm_counters.get(track_id, 0) >= self.config.min_alarm_frames:
+            elif self._alarm_counters.get(track_id, 0) >= self.config.min_alarm_frames:
                 risk_level = raw_risk_level
             else:
                 risk_level = 0
@@ -323,21 +331,30 @@ class SideCollisionDetector:
         
         return vx, vy
     
-    def _is_in_monitor_zone(self, x: float, y: float) -> bool:
+    def _is_in_monitor_zone(self, x: float, y: float, distance_x: float = None) -> bool:
         """
         判断目标是否在监控区域内
         
         Args:
-            x: 横向距离（米）
+            x: 横向距离（米，原始坐标）
             y: 纵向距离（米）
+            distance_x: 到车身边缘的距离（米），如果提供则用于贴身车辆判断
         
         Returns:
             是否在监控区域
         """
         cfg = self.config
         
+        # 对于贴身车辆（distance_x < immediate_alarm_distance），使用更宽松的Y轴范围
+        if distance_x is not None and distance_x < cfg.immediate_alarm_distance:
+            y_min = cfg.monitor_y_min_close
+            y_max = cfg.monitor_y_max_close
+        else:
+            y_min = cfg.monitor_y_min
+            y_max = cfg.monitor_y_max
+        
         # 检查纵向范围
-        if not (cfg.monitor_y_min <= y <= cfg.monitor_y_max):
+        if not (y_min <= y <= y_max):
             return False
         
         # 检查横向范围
@@ -466,23 +483,23 @@ class SideCollisionDetector:
         """
         cfg = self.config
 
-        # ========== 第一级：红色强制报警（X < 1.2m）==========
+        # ========== 第一级：红色强制报警（X < 2.0m）==========
         # 只要目标进入此范围，无视速度和Y轴，立即报警
         # 这是最后一道防线，确保贴身危险绝不漏报
-        if distance_x < 1.2:
+        if distance_x < 2.0:
             return 2
 
-        # ========== 第二级：黄色预警（1.2m ≤ X < 3.5m）==========
+        # ========== 第二级：黄色预警（2.0m ≤ X < 5.0m）==========
         # 在此范围内，结合Y轴判定（是否在车旁）触发预警
         # 如果纵向速度vy为正或接近0，说明在车旁（正在超越或并行）
-        if distance_x < cfg.bsd_distance:  # 3.5m
+        if distance_x < cfg.bsd_distance:  # 5.0m
             # 目标正在向后掉队，降低预警等级或忽略
             if vy < 0:
                 return 0
             # 目标在车旁，保持黄色预警
             return 1
 
-        # ========== 第三级：安全区域（X ≥ 3.5m）==========
+        # ========== 第三级：安全区域（X ≥ 5.0m）==========
         # 使用TTL计算，只有当TTL < 1.0s且X正在减小时触发动态报警
         # 速度过滤：如果目标正在向后掉队（vy < 0），忽略
         if vy < 0:

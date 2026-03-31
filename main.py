@@ -31,6 +31,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from core.front_detector import FrontCollisionDetector
 from core.side_detector import SideCollisionDetector
 from core.ipm import IPM_Transformer
+from core.side_ipm import get_side_ipm, switch_side_ipm
 from core.view_classifier import ViewClassifier
 from core.side_alarm import SideAlarm
 from core.front_alarm import FrontAlarm
@@ -737,6 +738,7 @@ class VideoThread(QtCore.QThread):
         
         # IPM & 轨迹评估
         self.ipm = IPM_Transformer()  # 前向 IPM
+        self.side_ipm = get_side_ipm("left")  # 侧面 IPM（支持左右切换）
         self.current_ipm = self.ipm  # 当前使用的 IPM
         self._world_history = {}
         self.vehicle_width = 1.9  # 车辆宽度 (m)
@@ -1359,8 +1361,15 @@ class VideoThread(QtCore.QThread):
             min_ttc_alert = 99.0
             min_id_alert = -1
             
-            # 使用前向IPM（侧向视角待重构）
-            self.current_ipm = self.ipm
+            # 根据视角选择正确的 IPM
+            if self.current_perspective == "侧面视角":
+                # 侧面视角：使用侧面 IPM，并根据相机侧切换
+                camera_side = self.side_alarm.camera_side if self.side_alarm else "left"
+                self.side_ipm = switch_side_ipm(camera_side)
+                self.current_ipm = self.side_ipm
+            else:
+                # 前向视角：使用前向 IPM
+                self.current_ipm = self.ipm
             
             for track_id, x1, y1, x2, y2, cx, cy, class_name in infos:
                 # 侧面视角不需要检测线过滤
@@ -1409,28 +1418,103 @@ class VideoThread(QtCore.QThread):
                 # 根据视角选择不同的碰撞检测逻辑
                 if self.current_perspective == "侧面视角":
                     # 侧向视角：使用侧面碰撞检测器
-                    if self.current_ipm:
-                        world_pos = self.current_ipm.pixel_to_ground(cx, y2, (h, w))
+                    lateral_state = None
+                    debug_info = ""
+                    
+                    # ========== 新增：画面正下方近距离直接报警逻辑 ==========
+                    # 当车辆非常靠近（检测框很大）且在画面底部中心区域时，直接报警
+                    bbox_width = x2 - x1
+                    bbox_height = y2 - y1
+                    bottom_y = max(y1, y2)
+                    
+                    # 计算检测框中心点x坐标
+                    bbox_cx = (x1 + x2) // 2
+                    
+                    # 判断检测框中心是否靠近图像中心水平线（距离中心不超过40%图像宽度）
+                    near_center_x = abs(bbox_cx - w // 2) < (w * 0.40)
+                    # 判断检测框是否足够大（宽度超过图像宽度的30%或高度超过图像高度的40%）
+                    large_bbox = (bbox_width > w * 0.30) or (bbox_height > h * 0.40)
+                    # 判断检测框是否靠近车身一侧（根据相机侧）
+                    if self.side_ipm and self.side_ipm.camera_side == "left":
+                        # 左相机：车身在右侧，检测框右侧应靠近图像右边缘
+                        near_vehicle_side = x2 > w * 0.6
+                    else:
+                        # 右相机：车身在左侧，检测框左侧应靠近图像左边缘
+                        near_vehicle_side = x1 < w * 0.4
+                    
+                    immediate_alarm = near_center_x and large_bbox and near_vehicle_side
+                    
+                    if self.side_ipm and not immediate_alarm:
+                        # 使用靠近车身一侧的底角点进行 IPM 转换
+                        corner_u, corner_v = self.side_ipm.get_side_corner_point(x1, y1, x2, y2)
+                        world_pos = self.side_ipm.pixel_to_ground(corner_u, corner_v, (h, w))
+                        used_corner = True
+                        
+                        # 如果底角点 IPM 失败，尝试使用底边中心点作为备用
+                        if world_pos is None:
+                            center_x = (x1 + x2) // 2
+                            bottom_y = max(y1, y2)
+                            world_pos = self.side_ipm.pixel_to_ground(center_x, bottom_y, (h, w))
+                            used_corner = False
+                        
                         if world_pos is not None:
+                            x_ground, y_ground = world_pos
+                            corner_tag = "C" if used_corner else "M"  # C=角点, M=中点
+                            debug_info = f"X:{x_ground:.1f}m{corner_tag}"
                             self._update_world_track(track_id, world_pos)
                             intent, yaw_deg, angle_cost = self._predict_intent(track_id, world_pos)
+                            
+                            # 使用侧面碰撞检测器
+                            if self.side_detector:
+                                lateral_state = self.side_detector.update(
+                                    track_id,
+                                    world_pos,
+                                    class_name,
+                                    self.v_self_mps
+                                )
+                                if lateral_state:
+                                    debug_info = f"X:{lateral_state.distance_x:.1f}m{corner_tag} R:{lateral_state.risk_level}"
+                                else:
+                                    # 获取详细调试信息
+                                    target_state = self.side_detector.get_target_state(track_id)
+                                    if target_state:
+                                        seen_frames = target_state.get('seen_frames', 0)
+                                        vx_ema = target_state.get('vx_ema', 0)
+                                        x_hist = target_state.get('x_history', [])
+                                        y_hist = target_state.get('y_history', [])
+                                        y_val = y_hist[-1] if y_hist else 0
+                                        debug_info = f"X:{x_ground:.1f}m Y:{y_val:.1f}m F:{seen_frames} VX:{vx_ema:.2f}"
+                                    else:
+                                        debug_info = f"X:{x_ground:.1f}m NO_TRACK"
+                        else:
+                            # IPM 完全失败，显示尝试过的点
+                            center_x = (x1 + x2) // 2
+                            bottom_y_val = max(y1, y2)
+                            debug_info = f"IPM_FAIL({corner_u},{corner_v})&({center_x},{bottom_y_val})"
+                    elif immediate_alarm:
+                        # 直接报警模式：不依赖 IPM，基于图像特征直接判定
+                        debug_info = f"IMMEDIATE_ALARM"
+                        risk_level = 2
+                        in_path = True
+                        red_allowed = True
+                        ttc = 0.5  # 极短 TTC
+                        vx = 0.0
+                        vy = 0.0
+                        is_static = False
+                        dw_dt = 0.0
+                        vw = 0.0
+                    else:
+                        debug_info = "NO_IPM"
                     
-                    # 使用侧面碰撞检测器
-                    if world_pos is not None:
-                        lateral_state = self.side_detector.update(
-                            track_id,
-                            world_pos,
-                            class_name,
-                            self.v_self_mps
-                        )
-                        
+                    # 设置返回值（如果不是直接报警模式）
+                    if not immediate_alarm:
                         if lateral_state:
                             ttc = lateral_state.ttl_lateral
                             vx = lateral_state.vx
                             vy = lateral_state.vy
                             is_static = lateral_state.is_static
                             risk_level = lateral_state.risk_level
-                            in_path = True  # 侧面视角使用IPM判定
+                            in_path = True
                             red_allowed = True
                             dw_dt = 0.0
                             vw = 0.0
@@ -1444,16 +1528,9 @@ class VideoThread(QtCore.QThread):
                             red_allowed = False
                             dw_dt = 0.0
                             vw = 0.0
-                    else:
-                        ttc = 99.0
-                        vx = 0.0
-                        vy = 0.0
-                        is_static = False
-                        risk_level = 0
-                        in_path = False
-                        red_allowed = False
-                        dw_dt = 0.0
-                        vw = 0.0
+                    
+                    # 强制在标签中显示调试信息
+                    label = f"[{track_id}] {class_name} {debug_info}"
                 else:
                     # 前向视角：使用正面碰撞检测器
                     if self.current_ipm:
@@ -1571,33 +1648,28 @@ class VideoThread(QtCore.QThread):
                         track_id, class_name, ttc, y2, warning_line_y, lateral_fast, red_ok
                     )
                 else:
-                    color, label, thickness = self.side_alarm.get_display_params(
-                        track_id, class_name, ttc, x1, x2, vx, warning_line_x, yellow_line_x
-                    )
-                if risk_level == 2:
-                    color = (0, 0, 255)
-                    thickness = 3
-                elif risk_level == 1:
-                    color = (0, 255, 255)
-                    thickness = max(thickness, 2)
-
-                if sdt_tag:
-                    if safe_dist is not None:
-                        label = f"SDT {safe_dist:.1f}m"
+                    # 侧面视角：使用强制设置的标签（包含调试信息）
+                    if risk_level == 2:
+                        color = (0, 0, 255)
+                        thickness = 3
+                    elif risk_level == 1:
+                        color = (0, 255, 255)
+                        thickness = 2
                     else:
-                        label = label.replace("TTC", "SDT") if "TTC" in label else f"SDT {label}"
-                if obj_dist is not None:
-                    label += f" {obj_dist:.1f}m"
-                if v_rel is not None:
-                    label += f" v={v_rel:.1f}m/s"
+                        color = (0, 255, 0)
+                        thickness = 2
+                    # 确保 label 已定义（如果之前的代码路径没有设置，使用默认值）
+                    if 'label' not in locals():
+                        label = f"[{track_id}] {class_name}"
                 
                 # 根据视角绘制L型角框
                 if self.current_perspective == "前向视角":
                     frame = self.front_alarm.draw_l_corners(frame, x1, y1, x2, y2, color, thickness=thickness, seg=18)
+                    deferred_draws.append((label, (x1, y1 - 35), 24, color))
                 else:
                     frame = self.side_alarm.draw_l_corners(frame, x1, y1, x2, y2, color, thickness=thickness, seg=18)
-                # 延迟绘制标签
-                deferred_draws.append((label, (x1, y1 - 35), 24, color))
+                    # 侧面视角：使用强制设置的标签
+                    deferred_draws.append((label, (x1, y1 - 35), 24, color))
 
             if min_ttc < 1.5:
                 if self._frame_count % 2 == 0:
