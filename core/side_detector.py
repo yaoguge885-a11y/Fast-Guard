@@ -10,6 +10,8 @@ from typing import Tuple, Optional, Dict, List
 from dataclasses import dataclass
 import math
 
+from core.reasoning_logger import ReasoningLogger
+
 
 @dataclass
 class LateralTargetState:
@@ -100,7 +102,8 @@ class SideCollisionDetector:
         self,
         fps: float = 30.0,
         config: Optional[SideDetectorConfig] = None,
-        camera_side: str = "left"  # "left" 或 "right"
+        camera_side: str = "left",  # "left" 或 "right"
+        logger: Optional[ReasoningLogger] = None
     ):
         """
         初始化侧面碰撞检测器
@@ -109,10 +112,12 @@ class SideCollisionDetector:
             fps: 视频帧率
             config: 配置参数，若为 None 则使用默认配置
             camera_side: 相机位置，"left" 或 "right"
+            logger: ReasoningLogger 实例，若为 None 则创建新实例
         """
         self.fps = fps if fps and fps > 0 else 30.0
         self.config = config or SideDetectorConfig()
         self.camera_side = camera_side
+        self.logger = logger or ReasoningLogger()
         
         # 历史数据存储
         self._x_history: Dict[int, deque] = {}      # 横向位置历史
@@ -173,6 +178,9 @@ class SideCollisionDetector:
         # 更新出现帧数
         self._seen_frames[track_id] = self._seen_frames.get(track_id, 0) + 1
         
+        # 最少观察 3 帧才参与风险判定（减少闪现误报）
+        min_observe_frames = 3
+        
         # 初始化历史队列
         if track_id not in self._x_history:
             self._x_history[track_id] = deque(maxlen=cfg.history_length)
@@ -224,12 +232,18 @@ class SideCollisionDetector:
         is_static = self._is_static(track_id)
         if is_static:
             self._static_targets.add(track_id)
+            # 记录静态目标过滤日志
+            self.logger.add_log(f"[ID:{track_id}] 判定为静止目标，过滤")
         else:
             self._static_targets.discard(track_id)
         
         # 判断是否正在靠近（只要距离连续减少就判定为靠近）
         is_approaching = self._is_approaching(track_id)
         approach_speed = abs(vx_smooth) if is_approaching else 0.0
+        
+        # 速度过滤日志
+        if abs(vx_smooth) < self.config.max_safe_speed:
+            self.logger.add_log(f"[ID:{track_id}] 横向速度 {abs(vx_smooth):.2f}m/s < 阈值，判定为安全平行")
         
         # 计算 TTL（侧向侵入时间）
         ttl = self._calculate_ttl(distance_x, vx_smooth, is_approaching)
@@ -242,6 +256,10 @@ class SideCollisionDetector:
             distance_x, ttl, is_approaching, approach_speed, is_static, is_in_bsd, vy
         )
         
+        # 记录风险判定日志
+        if raw_risk_level > 0:
+            self.logger.add_log(f"[ID:{track_id}] 原始风险等级: {raw_risk_level}, TTL: {ttl:.2f}s, 距离: {distance_x:.1f}m")
+        
         # 报警连续帧计数逻辑
         # 紧急情况（risk_level == 2）跳过计数器，立即输出报警
         # 只有 temp_risk == 1 时才需要连续帧过滤，防止误报
@@ -250,15 +268,27 @@ class SideCollisionDetector:
             risk_level = 2
             # 保持计数器累积，但不依赖它
             self._alarm_counters[track_id] = self._alarm_counters.get(track_id, 0) + 1
+            # 记录危险报警日志
+            self.logger.add_log(f"[ID:{track_id}] TTL: {ttl:.2f}s < {cfg.ttl_danger_threshold}s，触发二级预警")
         elif raw_risk_level > 0:
             # 满足报警条件（黄色预警），计数器加1
-            self._alarm_counters[track_id] = self._alarm_counters.get(track_id, 0) + 1
-            # 贴身车辆（distance_x < immediate_alarm_distance）立即报警，不等待连续帧
-            if distance_x < cfg.immediate_alarm_distance:
+            current_count = self._alarm_counters.get(track_id, 0) + 1
+            self._alarm_counters[track_id] = current_count
+            
+            # 记录连续帧计数日志
+            self.logger.add_log(f"[ID:{track_id}] 检测到侵入趋势，计数器: {current_count}/{self.config.min_alarm_frames}")
+            
+            # 最少观察帧数过滤
+            if self._seen_frames.get(track_id, 0) < min_observe_frames:
+                risk_level = 0
+            # 贴身车辆（distance_x < immediate_alarm_distance）立即报警
+            elif distance_x < cfg.immediate_alarm_distance:
                 risk_level = raw_risk_level
+                self.logger.add_log(f"[ID:{track_id}] 距离 {distance_x:.1f}m < 阈值，立即报警")
             # 只有连续帧数达到阈值才输出真正的报警
-            elif self._alarm_counters.get(track_id, 0) >= self.config.min_alarm_frames:
+            elif current_count >= self.config.min_alarm_frames:
                 risk_level = raw_risk_level
+                self.logger.add_log(f"[ID:{track_id}] 连续 {current_count} 帧确认，触发预警")
             else:
                 risk_level = 0
         else:
@@ -483,25 +513,22 @@ class SideCollisionDetector:
         """
         cfg = self.config
 
-        # ========== 第一级：红色强制报警（X < 2.0m）==========
-        # 只要目标进入此范围，无视速度和Y轴，立即报警
-        # 这是最后一道防线，确保贴身危险绝不漏报
-        if distance_x < 2.0:
+        # ========== 第一级：红色强制报警（X < 1.0m）==========
+        # 突破 0.8m 壁垒 + 0.2m 缓冲，立即报警
+        if distance_x < 1.0:
+            if vy < -0.5:
+                # 目标正在明显向后掉队（例如我方正在超越），降级为黄警
+                return 1
             return 2
 
-        # ========== 第二级：黄色预警（2.0m ≤ X < 5.0m）==========
-        # 在此范围内，结合Y轴判定（是否在车旁）触发预警
-        # 如果纵向速度vy为正或接近0，说明在车旁（正在超越或并行）
-        if distance_x < cfg.bsd_distance:  # 5.0m
-            # 目标正在向后掉队，降低预警等级或忽略
+        # ========== 第二级：黄色预警（1.0m ≤ X < 3.0m）==========
+        if distance_x < 3.0:
+            # 目标正在向后掉队，降低预警
             if vy < 0:
                 return 0
-            # 目标在车旁，保持黄色预警
             return 1
 
-        # ========== 第三级：安全区域（X ≥ 5.0m）==========
-        # 使用TTL计算，只有当TTL < 1.0s且X正在减小时触发动态报警
-        # 速度过滤：如果目标正在向后掉队（vy < 0），忽略
+        # ========== 第三级：安全区域（X ≥ 3.0m）==========
         if vy < 0:
             return 0
 

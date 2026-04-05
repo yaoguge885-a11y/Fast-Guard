@@ -43,8 +43,8 @@ from core.side_collision import *
 # === 5. 核心视频处理线程 (视频读取、预处理、YOLO 推理与预警) ===
 # ==================================================================================
 class VideoThread(QtCore.QThread):
-    # 修改信号签名：发送三张图像 (Original, Preprocessed, Inference)
-    frame_signal = QtCore.pyqtSignal(QtGui.QImage, QtGui.QImage, QtGui.QImage)
+    # 修改信号签名：发送四张图像 (Original, Preprocessed, Inference, BEV)
+    frame_signal = QtCore.pyqtSignal(QtGui.QImage, QtGui.QImage, QtGui.QImage, QtGui.QImage)
     status_signal = QtCore.pyqtSignal(str)
 
     ttc_signal = QtCore.pyqtSignal(float, int)
@@ -55,8 +55,7 @@ class VideoThread(QtCore.QThread):
     debug_signal = QtCore.pyqtSignal(dict)
     position_signal = QtCore.pyqtSignal(int, int, float, float)
     hud_signal = QtCore.pyqtSignal(dict)
-
-
+    perspective_signal = QtCore.pyqtSignal(str) # 补充缺失的信号定义
 
     def __init__(self, source, model_path, parent=None, weak_conf_threshold=0.38, edge_strength_threshold=28.0):
         super().__init__(parent)
@@ -70,6 +69,7 @@ class VideoThread(QtCore.QThread):
         self._last_centers = {}
         self._seen_counts = {}
         self.forward_calculator = None
+        self.perspective_signal = self.perspective_signal # 给 self 赋值
         
         # IPM & 轨迹评估
         self.ipm = IPM_Transformer()
@@ -106,6 +106,8 @@ class VideoThread(QtCore.QThread):
         # 锁定相关状态变量
         self._forward_lock_count = 0
         self._locked_warning_y = None
+        self.perspective_locked = False
+        self.current_perspective = "分析中..."
 
         # ---------- 中文字体路径设置 ----------
 
@@ -358,6 +360,65 @@ class VideoThread(QtCore.QThread):
         angle_cost = abs(yaw_deg) / 180.0  # 夹角代价，用于平滑/抑制抖动
         return intent, yaw_deg, angle_cost
 
+    def _draw_bev(self, bev_objects):
+        """
+        绘制俯视图 (Bird's Eye View)
+        bev_objects: list of (world_pos (X, Y), class_name, risk_level)
+        """
+        # 画布设置：300x400, 1米 = 10像素
+        bev_w, bev_h = 300, 400
+        bev_img = np.zeros((bev_h, bev_w, 3), dtype=np.uint8) + 25  # 深灰色背景
+        
+        # 比例尺与坐标原点 (本车中心位于下方)
+        scale = 10.0 # 10px / m
+        origin_x = bev_w // 2
+        origin_y = bev_h - 50 # 留点底边给本车看后面
+        
+        # 1. 绘制网格线 (5米一格)
+        for d in range(0, 40, 5):
+            y = origin_y - int(d * scale)
+            if 0 <= y < bev_h:
+                cv2.line(bev_img, (0, y), (bev_w, y), (50, 50, 50), 1)
+                cv2.putText(bev_img, f"{d}m", (5, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1)
+        
+        # 2. 绘制本车 (Ego Vehicle)
+        ego_w = int(self.vehicle_width * scale)
+        ego_l = int(4.5 * scale) # 假设车长 4.5m
+        cv2.rectangle(bev_img, 
+                      (origin_x - ego_w // 2, origin_y - ego_l),
+                      (origin_x + ego_w // 2, origin_y), 
+                      (100, 100, 255), -1) # 蓝色本车
+        cv2.putText(bev_img, "SELF", (origin_x - 15, origin_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 255), 1)
+
+        # 3. 绘制检测到的目标
+        color_map = {
+            "car": (255, 150, 0),     # 橙色
+            "truck": (200, 100, 0),   # 深橙
+            "bus": (200, 100, 0),
+            "motorcycle": (0, 0, 255), # 红色 (重点)
+            "bicycle": (0, 150, 255), # 浅蓝
+            "person": (0, 255, 0)      # 绿色
+        }
+        
+        for world_pos, class_name, risk_level in bev_objects:
+            # X, Y (世界坐标: X右正, Y前正) -> 图像坐标
+            img_x = origin_x + int(world_pos[0] * scale)
+            img_y = origin_y - int(world_pos[1] * scale)
+            
+            if 0 <= img_x < bev_w and 0 <= img_y < bev_h:
+                color = color_map.get(class_name, (200, 200, 200))
+                # 如果有风险，强制变红闪烁或加粗 (这里简单处理：加个外圈)
+                if risk_level > 0:
+                    cv2.circle(bev_img, (img_x, img_y), 10, (0, 0, 255), 2)
+                
+                # 绘制目标点 (摩托车投射成一个实心圆点)
+                cv2.circle(bev_img, (img_x, img_y), 6, color, -1)
+                # 绘制简短类名
+                label = class_name[:3].upper()
+                cv2.putText(bev_img, label, (img_x + 8, img_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+
+        return bev_img
+
 
     # --- 核心主循环 ---
     def run(self):
@@ -513,8 +574,13 @@ class VideoThread(QtCore.QThread):
                 preview_image = QtGui.QImage(
                     rgb_preview.data, pw, ph, bytes_per_line_preview, QtGui.QImage.Format_RGB888
                 )
-                # 拖拽时三画面同步显示原图
-                self.frame_signal.emit(preview_image.copy(), preview_image.copy(), preview_image.copy())
+                
+                # 创建空白 BEV 占位
+                bev_empty = np.zeros((400, 300, 3), dtype=np.uint8) + 20
+                bev_qimg = QtGui.QImage(bev_empty.data, 300, 400, 300 * 3, QtGui.QImage.Format_RGB888)
+
+                # 拖拽时三画面同步显示原图 + 空白 BEV
+                self.frame_signal.emit(preview_image.copy(), preview_image.copy(), preview_image.copy(), bev_qimg)
                 self.position_signal.emit(
                     current_frame_idx,
                     self.total_frames,
@@ -585,6 +651,7 @@ class VideoThread(QtCore.QThread):
             bikes = []
             dx_list = []
             dy_list = []
+            bev_data = [] # 记录投影点信息
             if results:
                 boxes = results[0].boxes
                 if boxes is not None and len(boxes) > 0:
@@ -800,6 +867,10 @@ class VideoThread(QtCore.QThread):
                     warn_ttc = 2.0
                 elif ttc < 1.5 and not red_ok:
                     warn_ttc = 1.5
+                
+                # 收集 BEV 投影点 (独立于 warn_ttc 逻辑)
+                if world_pos is not None:
+                    bev_data.append((world_pos, class_name, risk_level))
 
                 sdt_tag = False
                 if sdt_violation:
@@ -847,6 +918,19 @@ class VideoThread(QtCore.QThread):
             }
             self.hud_signal.emit(hud_payload)
 
+            # --- 清理已消失目标的缓存（防止长视频内存泄漏） ---
+            if self._frame_count % 30 == 0:
+                current_track_ids = {rec[0] for rec in infos}
+                stale_ids = [tid for tid in self._last_centers.keys() if tid not in current_track_ids]
+                for tid in stale_ids:
+                    self._last_centers.pop(tid, None)
+                    self._seen_counts.pop(tid, None)
+                    self._last_distance.pop(tid, None)
+                    self._vrel_history.pop(tid, None)
+                    self._world_history.pop(tid, None)
+                if self.forward_calculator:
+                    self.forward_calculator.clean_stale_tracks(current_track_ids)
+
             # 5. 批量执行中文绘制
             if deferred_draws:
                 frame = self._draw_batch_chinese(frame, deferred_draws)
@@ -869,8 +953,13 @@ class VideoThread(QtCore.QThread):
             bytes_inf = ch_inf * w_inf
             qimage_inf = QtGui.QImage(rgb_inf.data, w_inf, h_inf, bytes_inf, QtGui.QImage.Format_RGB888)
 
-            # 发送三路画面
-            self.frame_signal.emit(qimage_orig.copy(), qimage_pre.copy(), qimage_inf.copy())
+            # 4. Bird's Eye View (BEV)
+            bev_img = self._draw_bev(bev_data)
+            bev_rgb = cv2.cvtColor(bev_img, cv2.COLOR_BGR2RGB)
+            qimage_bev = QtGui.QImage(bev_rgb.data, 300, 400, 300 * 3, QtGui.QImage.Format_RGB888)
+
+            # 发送四路画面
+            self.frame_signal.emit(qimage_orig.copy(), qimage_pre.copy(), qimage_inf.copy(), qimage_bev.copy())
 
             self.position_signal.emit(
                 current_frame_idx,

@@ -6,36 +6,13 @@ import sys
 import time
 import math
 import shutil
-import logging
-
-# 设置全局系统日志记录器
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
-os.makedirs(LOG_DIR, exist_ok=True)
-LOG_TIMESTAMP = time.strftime('%Y%m%d_%H%M%S')
-LOG_FILE = os.path.join(LOG_DIR, f'system_log_{LOG_TIMESTAMP}.log')
-
-SYSTEM_LOGGER = logging.getLogger(f'System_{LOG_TIMESTAMP}')
-SYSTEM_LOGGER.setLevel(logging.DEBUG)
-SYSTEM_LOGGER.handlers = []
-fh = logging.FileHandler(LOG_FILE, encoding='utf-8')
-fh.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S')
-fh.setFormatter(formatter)
-SYSTEM_LOGGER.addHandler(fh)
-SYSTEM_LOGGER.info(f"系统启动，日志文件：{LOG_FILE}")
 
 import ultralytics
 import cv2
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
-from core.front_detector import FrontCollisionDetector
-from core.side_detector import SideCollisionDetector
+from core.calculator import TTCCalculator
 from core.ipm import IPM_Transformer
-from core.side_ipm import get_side_ipm, switch_side_ipm
-from core.view_classifier import ViewClassifier
-from core.side_alarm import SideAlarm
-from core.front_alarm import FrontAlarm
-from core.alarm import CollisionAlarm
 
 import torch
 import torch.nn as nn
@@ -151,12 +128,795 @@ def calculate_siou(pred_box, target_box):
     # 核心 SIoU 计算逻辑 (略：已根据标准数学公式实现)
     return 0.0 # 占位符，函数内可配置具体阈值逻辑
 
+# ---------------------------------------------
+
+# ==================================================================================
+# === 3. 侧向碰撞检测逻辑 (侧向视角预警算法) ===
+# ==================================================================================
+class SideCollisionDetector:
+    """侧向碰撞检测器，专门处理侧向视角的碰撞预警"""
+    
+    def __init__(self, frame_width, frame_height, fps):
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        self.fps = fps
+        
+        # 定义侧向检测区域
+        self.danger_zones = self._define_danger_zones()
+        
+        # 跟踪状态
+        self.side_objects = {}
+        self.last_warning_time = 0
+        self.warning_cooldown = 1.0
+        
+        # 开门杀相关参数
+        self.door_opening_zones = self._define_door_zones()
+        self.door_warning_active = False
+        
+        # 盲区监测
+        self.blind_zones = self._define_blind_zones()
+        
+        self.ego_speed = 0
+        self.side_clearance_threshold = 50
+        
+    def _define_danger_zones(self):
+        zones = {
+            'immediate': {
+                'left': (0, 0.1, 0.3, 0.7),
+                'right': (0.9, 1.0, 0.3, 0.7)
+            },
+            'warning': {
+                'left': (0.1, 0.25, 0.2, 0.8),
+                'right': (0.75, 0.9, 0.2, 0.8)
+            },
+            'alert': {
+                'left': (0.25, 0.4, 0.1, 0.9),
+                'right': (0.6, 0.75, 0.1, 0.9)
+            }
+        }
+        return zones
+    
+    def _define_door_zones(self):
+        zones = {
+            'front_door': {
+                'left': (0, 0.15, 0.4, 0.6),
+                'right': (0.85, 1.0, 0.4, 0.6)
+            },
+            'rear_door': {
+                'left': (0, 0.15, 0.6, 0.8),
+                'right': (0.85, 1.0, 0.6, 0.8)
+            }
+        }
+        return zones
+    
+    def _define_blind_zones(self):
+        zones = {
+            'left_blind': (0, 0.2, 0.3, 0.7),
+            'right_blind': (0.8, 1.0, 0.3, 0.7)
+        }
+        return zones
+    
+    def convert_ratio_to_pixel(self, zone_ratios):
+        x1 = int(zone_ratios[0] * self.frame_width)
+        x2 = int(zone_ratios[1] * self.frame_width)
+        y1 = int(zone_ratios[2] * self.frame_height)
+        y2 = int(zone_ratios[3] * self.frame_height)
+        return (x1, y1, x2, y2)
+    
+    def update_object_tracking(self, object_id, bbox, class_name, confidence):
+        x1, y1, x2, y2 = bbox
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        width = x2 - x1
+        height = y2 - y1
+        
+        current_time = time.time()
+        
+        if object_id not in self.side_objects:
+            self.side_objects[object_id] = {
+                'id': object_id,
+                'class': class_name,
+                'positions': [(cx, cy, current_time)],
+                'velocities': [],
+                'first_seen': current_time,
+                'last_seen': current_time,
+                'in_danger_zone': False,
+                'in_door_zone': False,
+                'in_blind_zone': False,
+                'warning_level': 0,
+                'lateral_speed': 0,
+                'closing_rate': 0
+            }
+        else:
+            obj = self.side_objects[object_id]
+            obj['positions'].append((cx, cy, current_time))
+            obj['last_seen'] = current_time
+            
+            if len(obj['positions']) >= 2:
+                prev_cx, prev_cy, prev_time = obj['positions'][-2]
+                time_diff = current_time - prev_time
+                if time_diff > 0:
+                    dx = cx - prev_cx
+                    dy = cy - prev_cy
+                    vx = dx / time_diff
+                    vy = dy / time_diff
+                    obj['velocities'].append((vx, vy))
+                    if len(obj['velocities']) > 5:
+                        obj['velocities'] = obj['velocities'][-5:]
+                    if obj['velocities']:
+                        avg_vx = np.mean([v[0] for v in obj['velocities']])
+                        avg_vy = np.mean([v[1] for v in obj['velocities']])
+                        obj['lateral_speed'] = avg_vx
+                        obj['closing_rate'] = -avg_vy if avg_vy < 0 else 0
+        
+        self._check_danger_zones(object_id, cx, cy, width, height)
+        self._check_door_zones(object_id, cx, cy)
+        self._check_blind_zones(object_id, cx, cy)
+        self._cleanup_old_objects(current_time)
+    
+    def _check_danger_zones(self, object_id, cx, cy, width, height):
+        obj = self.side_objects[object_id]
+        obj['in_danger_zone'] = False
+        obj['warning_level'] = 0
+        
+        for side, ratios in self.danger_zones['immediate'].items():
+            x1, y1, x2, y2 = self.convert_ratio_to_pixel(ratios)
+            if x1 <= cx <= x2 and y1 <= cy <= y2:
+                obj['in_danger_zone'] = True
+                obj['warning_level'] = 3
+                return
+        
+        for side, ratios in self.danger_zones['warning'].items():
+            x1, y1, x2, y2 = self.convert_ratio_to_pixel(ratios)
+            if x1 <= cx <= x2 and y1 <= cy <= y2:
+                obj['in_danger_zone'] = True
+                obj['warning_level'] = 2
+                return
+        
+        for side, ratios in self.danger_zones['alert'].items():
+            x1, y1, x2, y2 = self.convert_ratio_to_pixel(ratios)
+            if x1 <= cx <= x2 and y1 <= cy <= y2:
+                obj['in_danger_zone'] = True
+                obj['warning_level'] = 1
+                return
+    
+    def _check_door_zones(self, object_id, cx, cy):
+        obj = self.side_objects[object_id]
+        obj['in_door_zone'] = False
+        
+        for door_type, zones in self.door_opening_zones.items():
+            for side, ratios in zones.items():
+                x1, y1, x2, y2 = self.convert_ratio_to_pixel(ratios)
+                if x1 <= cx <= x2 and y1 <= cy <= y2:
+                    obj['in_door_zone'] = True
+                    if abs(obj['lateral_speed']) > 20:
+                        obj['warning_level'] = max(obj['warning_level'], 2)
+                    else:
+                        obj['warning_level'] = max(obj['warning_level'], 1)
+                    return
+    
+    def _check_blind_zones(self, object_id, cx, cy):
+        obj = self.side_objects[object_id]
+        obj['in_blind_zone'] = False
+        
+        for zone_name, ratios in self.blind_zones.items():
+            x1, y1, x2, y2 = self.convert_ratio_to_pixel(ratios)
+            if x1 <= cx <= x2 and y1 <= cy <= y2:
+                obj['in_blind_zone'] = True
+                obj['warning_level'] = max(obj['warning_level'], 1)
+                return
+    
+    def _cleanup_old_objects(self, current_time):
+        to_remove = []
+        for obj_id, obj in self.side_objects.items():
+            if current_time - obj['last_seen'] > 2.0:
+                to_remove.append(obj_id)
+        for obj_id in to_remove:
+            del self.side_objects[obj_id]
+    
+    def analyze_collision_risk(self):
+        """分析碰撞风险并返回中文警告信息"""
+        warnings = []
+        current_time = time.time()
+        
+        if current_time - self.last_warning_time < self.warning_cooldown:
+            return warnings
+        
+        for obj_id, obj in self.side_objects.items():
+            if current_time - obj['first_seen'] < 0.5:
+                continue
+            
+            warning = None
+            
+            if obj['warning_level'] >= 3:
+                warning = {
+                    'level': 'danger',
+                    'message': f"危险！{obj['class']} 紧贴车辆",
+                    'object_id': obj_id,
+                    'object_class': obj['class'],
+                    'position': obj['positions'][-1][:2] if obj['positions'] else (0, 0)
+                }
+            elif obj['warning_level'] >= 2:
+                warning = {
+                    'level': 'warning',
+                    'message': f"警告！{obj['class']} 快速接近",
+                    'object_id': obj_id,
+                    'object_class': obj['class'],
+                    'position': obj['positions'][-1][:2] if obj['positions'] else (0, 0)
+                }
+            elif obj['warning_level'] >= 1:
+                warning = {
+                    'level': 'alert',
+                    'message': f"注意！{obj['class']} 在侧方",
+                    'object_id': obj_id,
+                    'object_class': obj['class'],
+                    'position': obj['positions'][-1][:2] if obj['positions'] else (0, 0)
+                }
+            
+            if obj['in_door_zone'] and obj['warning_level'] >= 2:
+                warning = {
+                    'level': 'door_danger',
+                    'message': f"开门危险！{obj['class']} 接近车门",
+                    'object_id': obj_id,
+                    'object_class': obj['class'],
+                    'position': obj['positions'][-1][:2] if obj['positions'] else (0, 0)
+                }
+                self.door_warning_active = True
+            
+            if warning:
+                warnings.append(warning)
+                self.last_warning_time = current_time
+        
+        return warnings
+    
+    def draw_zones(self, frame):
+        """已完全移除区域绘制"""
+        return frame
+
+
+# ==================================================================================
+# === 4. 视角自动识别引擎 (正面/侧面视角分类与锁定) ===
+# ==================================================================================
+class ViewClassifier:
+    """视角分类器，基于静态特征和动态特征进行视角识别"""
+    
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self.frame_count = 0
+        self.last_frame = None
+        self.locked_perspective = None
+        self.confident_frames = 0
+        self.required_confident_frames = 5
+        self.last_result = "分析中..."
+        self.edge_history = []
+        self.flow_history = []
+        self.flow_pattern_history = []
+        self.car_region_history = []
+        self.vanish_history = []
+        self.confidence_history = []
+        self.initialized = False
+        self.last_process_time = 0
+
+    
+    def _detect_static_edge(self, frame):
+        """检测画面右边缘10%区域的固定边缘（优化版）"""
+        try:
+            h, w = frame.shape[:2]
+            edge_region_width = int(w * 0.1)
+            
+            # 降采样以提高性能
+            scale = 0.5
+            new_h, new_w = int(h * scale), int(w * scale)
+            new_edge_width = int(edge_region_width * scale)
+            
+            small_frame = cv2.resize(frame, (new_w, new_h))
+            edge_region = small_frame[:, -new_edge_width:]
+            
+            # 转换为灰度图
+            gray = cv2.cvtColor(edge_region, cv2.COLOR_BGR2GRAY)
+            
+            # 高斯模糊
+            blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+            
+            # Canny边缘检测
+            edges = cv2.Canny(blurred, 50, 150)
+            
+            # 计算边缘密度
+            edge_density = np.sum(edges > 0) / (new_edge_width * new_h)
+            
+            # 检测是否存在垂直边缘
+            vertical_edges = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+            vertical_edges = np.abs(vertical_edges)
+            vertical_edge_density = np.sum(vertical_edges > 50) / (new_edge_width * new_h)
+            
+            # 更严格的固定边缘判断（减少正面视角误判）
+            has_static_edge = edge_density > 0.14 and vertical_edge_density > 0.12
+
+            
+            return has_static_edge, edge_density, vertical_edge_density
+        except Exception as e:
+            print(f"边缘检测错误: {e}")
+            return False, 0.0, 0.0
+    
+    def _calculate_global_flow(self, current_frame, prev_frame):
+        """计算全局光流（优化版）"""
+        try:
+            # 降采样以提高性能
+            h, w = current_frame.shape[:2]
+            scale = 0.5
+            new_h, new_w = int(h * scale), int(w * scale)
+            
+            prev_small = cv2.resize(prev_frame, (new_w, new_h))
+            curr_small = cv2.resize(current_frame, (new_w, new_h))
+            
+            # 转换为灰度图
+            prev_gray = cv2.cvtColor(prev_small, cv2.COLOR_BGR2GRAY)
+            curr_gray = cv2.cvtColor(curr_small, cv2.COLOR_BGR2GRAY)
+            
+            # 使用Farneback光流算法（优化参数）
+            flow = cv2.calcOpticalFlowFarneback(
+                prev_gray, curr_gray, None, 
+                0.5, 3, 10, 3, 5, 1.2, 0
+            )
+            
+            # 计算水平分量比例（水平平移特征）
+            horizontal_flow = np.abs(flow[..., 0])
+            vertical_flow = np.abs(flow[..., 1])
+            
+            mean_horizontal = np.mean(horizontal_flow)
+            mean_vertical = np.mean(vertical_flow)
+            
+            if mean_vertical < 1e-6:
+                horizontal_ratio = 2.0  # 避免除零
+            else:
+                horizontal_ratio = mean_horizontal / mean_vertical
+            
+            return 0.0, 0.0, horizontal_ratio
+        except Exception as e:
+            print(f"光流计算错误: {e}")
+            return 0.0, 0.0, 0.5
+
+    def _car_body_mask_score(self, frame):
+        """估计左右 25% 区域是否存在稳定高亮车身"""
+        h, w = frame.shape[:2]
+        band_w = int(w * 0.25)
+        band = frame[:, :band_w]
+        band_r = frame[:, -band_w:]
+
+        def _score(region):
+            gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+            mean = float(np.mean(gray))
+            std = float(np.std(gray))
+            sobel = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            edge_mean = float(np.mean(np.abs(sobel)))
+            area = region.shape[0] * region.shape[1]
+            bright_ratio = np.sum(gray > 190) / max(1, area)
+            # 明亮且纹理稳定 → 车身概率高
+            side_score = bright_ratio * 0.6 + max(0.0, (220 - std) / 220) * 0.3 + max(0.0, (30 - edge_mean) / 30) * 0.1
+            forward_score = 1.0 - side_score
+            return side_score, forward_score
+
+        left_side, left_forward = _score(band)
+        right_side, right_forward = _score(band_r)
+        # 取两侧最大值作为侧向信号，平均作为前向抵消
+        side_score = max(left_side, right_side)
+        forward_score = (left_forward + right_forward) / 2.0
+        return side_score, forward_score
+
+    def _vanish_line_score(self, frame):
+        """基于Hough线斜率和汇聚点估计视角"""
+        h, w = frame.shape[:2]
+        small = cv2.resize(frame, (640, int(640 * h / max(1, w)))) if w > 0 else frame
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 80, 180)
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60, minLineLength=small.shape[1] // 5, maxLineGap=20)
+        if lines is None:
+            return 0.5, 0.5
+        slopes = []
+        intersections = []
+        for l in lines[:80]:
+            x1, y1, x2, y2 = l[0]
+            if x2 == x1:
+                continue
+            k = (y2 - y1) / max(1e-6, (x2 - x1))
+            slopes.append(k)
+            # 估算与中心水平线的交点
+            b = y1 - k * x1
+            x_at_center = (small.shape[0] / 2 - b) / max(1e-6, k)
+            intersections.append(x_at_center)
+        if not slopes:
+            return 0.5, 0.5
+        slopes = np.array(slopes)
+        intersections = np.array(intersections)
+        pos = np.sum(slopes > 0)
+        neg = np.sum(slopes < 0)
+        ratio_single = abs(pos - neg) / max(1, pos + neg)
+        # 汇聚点偏离中心程度（归一到0~1，越小越居中）
+        center_x = small.shape[1] / 2
+        vanish_offset = np.median(np.abs(intersections - center_x)) / max(1, small.shape[1])
+        # 单斜率 + 大偏移 → 侧向；对称 + 居中 → 前向
+        side_score = 0.6 * ratio_single + 0.4 * min(1.0, vanish_offset * 2)
+        forward_score = 1.0 - side_score
+        return side_score, forward_score
+
+    def _flow_pattern_score(self, current_frame, prev_frame):
+        """利用光流判断辐射(前向) vs 平移(侧向)"""
+        if prev_frame is None:
+            return 0.5, 0.5
+        h, w = current_frame.shape[:2]
+        scale = 0.4
+        new_h, new_w = int(h * scale), int(w * scale)
+        prev_small = cv2.resize(prev_frame, (new_w, new_h))
+        curr_small = cv2.resize(current_frame, (new_w, new_h))
+        prev_gray = cv2.cvtColor(prev_small, cv2.COLOR_BGR2GRAY)
+        curr_gray = cv2.cvtColor(curr_small, cv2.COLOR_BGR2GRAY)
+        flow = cv2.calcOpticalFlowFarneback(
+            prev_gray, curr_gray, None,
+            0.5, 3, 12, 3, 5, 1.1, 0
+        )
+        fx = flow[..., 0]
+        fy = flow[..., 1]
+        mag = np.sqrt(fx ** 2 + fy ** 2)
+        cx, cy = new_w / 2, new_h / 2
+        ys, xs = np.meshgrid(np.arange(new_h), np.arange(new_w), indexing='ij')
+        vx = xs - cx
+        vy = ys - cy
+        norm = np.sqrt(vx ** 2 + vy ** 2) + 1e-6
+        vx /= norm
+        vy /= norm
+        radial = (fx * vx + fy * vy) / (np.sqrt(fx ** 2 + fy ** 2) + 1e-6)
+        radial_score = float(np.clip(np.nan_to_num(np.mean(radial * (mag > np.median(mag)))), -1, 1))
+        mean_fx = float(np.mean(fx))
+        mean_fy = float(np.mean(fy))
+        mean_mag = np.sqrt(mean_fx ** 2 + mean_fy ** 2) + 1e-6
+        trans_consistency = mean_mag / (np.std(fx) + np.std(fy) + 1e-6)
+        trans_score = float(np.clip(trans_consistency / 5.0, 0, 1))
+        # 辐射为正→前向；整体一致平移→侧向
+        forward_score = 0.6 * max(0.0, radial_score) + 0.4 * (1 - trans_score)
+        side_score = 1.0 - forward_score
+        return side_score, forward_score
+
+    
+    def analyze_frame(self, frame, detections=None):
+        """分析单帧画面，返回前向和侧向的得分（优化版）"""
+        import time
+        
+        # 性能监控
+        start_time = time.time()
+        
+        if self.locked_perspective:
+            if self.locked_perspective == "前向视角":
+                return 0.95, 0.05
+            else:
+                return 0.05, 0.95
+        
+        self.frame_count += 1
+        
+        # 初始化检查
+        if not self.initialized:
+            self.initialized = True
+            # 初始化时直接返回中间值，避免第一帧处理
+            self.last_frame = frame.copy()
+            return 0.5, 0.5
+        
+        try:
+            # 静态特征检测（每3帧计算一次，进一步提高性能）
+            has_static_edge = False
+            edge_density = 0.0
+            vertical_edge_density = 0.0
+            
+            if self.frame_count % 3 == 0:
+                has_static_edge, edge_density, vertical_edge_density = self._detect_static_edge(frame)
+            elif self.edge_history:
+                # 使用上一次的边缘检测结果
+                last_edge = self.edge_history[-1]
+                has_static_edge = last_edge['has_static_edge']
+                edge_density = last_edge['edge_density']
+                vertical_edge_density = last_edge['vertical_edge_density']
+
+            # 检测分布修正：若目标都在中间且未贴右侧，则认为非侧向
+            near_right_edge = False
+            mid_band_hits = 0
+            total_det = 0
+            if detections:
+                h_det, w_det = frame.shape[:2]
+                for rec in detections:
+                    _, dx1, dy1, dx2, dy2, dcx, dcy, _ = rec
+                    total_det += 1
+                    if dx2 >= int(w_det * 0.9):
+                        near_right_edge = True
+                    cx_norm = dcx / max(1, w_det)
+                    if 0.28 <= cx_norm <= 0.72:
+                        mid_band_hits += 1
+                if mid_band_hits >= 1 and not near_right_edge:
+                    has_static_edge = False
+
+            # 车身占位检测（每4帧）
+            car_side_score = car_forward_score = 0.5
+            if self.frame_count % 4 == 0:
+                car_side_score, car_forward_score = self._car_body_mask_score(frame)
+            elif self.car_region_history:
+                last_car = self.car_region_history[-1]
+                car_side_score = last_car['side']
+                car_forward_score = last_car['forward']
+
+            # 线特征（每5帧）
+            vanish_side = vanish_forward = 0.5
+            if self.frame_count % 5 == 0:
+                vanish_side, vanish_forward = self._vanish_line_score(frame)
+            elif self.vanish_history:
+                last_v = self.vanish_history[-1]
+                vanish_side = last_v['side']
+                vanish_forward = last_v['forward']
+
+            # 动态特征检测（每4帧计算一次光流，大幅提高性能）
+            horizontal_ratio = 0.5
+            flow_pattern_side = flow_pattern_forward = 0.5
+            if self.last_frame is not None and self.frame_count % 4 == 0:
+                _, _, horizontal_ratio = self._calculate_global_flow(frame, self.last_frame)
+                flow_pattern_side, flow_pattern_forward = self._flow_pattern_score(frame, self.last_frame)
+            elif self.flow_history:
+                # 使用上一次的光流结果
+                last_flow = self.flow_history[-1]
+                horizontal_ratio = last_flow['horizontal_ratio']
+            if self.flow_pattern_history:
+                flow_pattern_side = self.flow_pattern_history[-1]['side']
+                flow_pattern_forward = self.flow_pattern_history[-1]['forward']
+            
+            # 更新上一帧（只在需要时更新）
+            if self.frame_count % 2 == 0:
+                self.last_frame = frame.copy()
+            
+            # 计算视角得分
+            if has_static_edge:
+                static_side_score = 0.7
+                static_forward_score = 0.3
+            else:
+                static_side_score = 0.15
+                static_forward_score = 0.85
+            
+            # 动态特征得分（水平平移倾向于侧向视角）
+            if horizontal_ratio > 1.35:
+                dynamic_side_score = 0.9
+                dynamic_forward_score = 0.1
+            elif horizontal_ratio < 0.9:
+                dynamic_side_score = 0.2
+                dynamic_forward_score = 0.8
+            else:
+                dynamic_side_score = 0.5
+                dynamic_forward_score = 0.5
+            
+            # 综合得分（加入车身/地平线/流模式）
+            forward_score = (
+                static_forward_score * 0.35
+                + dynamic_forward_score * 0.25
+                + car_forward_score * 0.15
+                + vanish_forward * 0.15
+                + flow_pattern_forward * 0.10
+            )
+            side_score = (
+                static_side_score * 0.35
+                + dynamic_side_score * 0.25
+                + car_side_score * 0.15
+                + vanish_side * 0.15
+                + flow_pattern_side * 0.10
+            )
+
+            # 强侧向加权：当车身占位显著时，侧向得分加成，前向减弱
+            if car_side_score > 0.45:
+                boost = min(0.32, (car_side_score - 0.45) * 0.8)
+                side_score += boost
+                forward_score -= boost * 0.5
+
+            side_score = float(np.clip(side_score, 0.0, 1.0))
+            forward_score = float(np.clip(forward_score, 0.0, 1.0))
+
+
+
+
+
+            
+            # 记录历史（每4帧记录一次，减少内存使用）
+            if self.frame_count % 4 == 0:
+                self.edge_history.append({
+                    'has_static_edge': has_static_edge,
+                    'edge_density': edge_density,
+                    'vertical_edge_density': vertical_edge_density
+                })
+                
+                self.flow_history.append({
+                    'horizontal_ratio': horizontal_ratio
+                })
+
+                self.flow_pattern_history.append({
+                    'side': flow_pattern_side,
+                    'forward': flow_pattern_forward
+                })
+
+                self.car_region_history.append({
+                    'side': car_side_score,
+                    'forward': car_forward_score
+                })
+
+                self.vanish_history.append({
+                    'side': vanish_side,
+                    'forward': vanish_forward
+                })
+                
+                self.confidence_history.append({
+                    'forward_score': forward_score,
+                    'side_score': side_score,
+                    'confidence': abs(forward_score - side_score)
+                })
+                
+                # 限制历史长度
+                if len(self.edge_history) > 3:
+                    self.edge_history = self.edge_history[-3:]
+                if len(self.flow_history) > 3:
+                    self.flow_history = self.flow_history[-3:]
+                if len(self.flow_pattern_history) > 3:
+                    self.flow_pattern_history = self.flow_pattern_history[-3:]
+                if len(self.car_region_history) > 3:
+                    self.car_region_history = self.car_region_history[-3:]
+                if len(self.vanish_history) > 3:
+                    self.vanish_history = self.vanish_history[-3:]
+                if len(self.confidence_history) > 3:
+                    self.confidence_history = self.confidence_history[-3:]
+
+            
+            # 性能监控
+            process_time = time.time() - start_time
+            self.last_process_time = process_time
+            
+            # 如果处理时间过长，返回默认值
+            if process_time > 0.1:  # 超过100ms认为处理过慢
+                print(f"视角分析处理时间过长: {process_time:.3f}s")
+                return 0.5, 0.5
+            
+            return forward_score, side_score
+            
+        except Exception as e:
+            print(f"视角分析错误: {e}")
+            return 0.5, 0.5
+    
+    def determine_perspective(self, force_result=False):
+        """确定最终视角"""
+        if self.locked_perspective:
+            return self.locked_perspective
+        
+        if self.frame_count < 3:
+            return "分析中..."
+        
+        # 分析历史数据
+        recent_confidence = self.confidence_history[-min(5, len(self.confidence_history)):]
+        if not recent_confidence:
+            return "分析中..."
+        
+        avg_forward = np.mean([c['forward_score'] for c in recent_confidence])
+        avg_side = np.mean([c['side_score'] for c in recent_confidence])
+        avg_confidence = np.mean([c['confidence'] for c in recent_confidence])
+        
+        # 分析静态特征历史
+        recent_edge = self.edge_history[-min(5, len(self.edge_history)):]
+        has_static_edge = any(e['has_static_edge'] for e in recent_edge) if recent_edge else False
+        avg_edge_density = np.mean([e['edge_density'] for e in recent_edge]) if recent_edge else 0
+        
+        # 分析动态特征历史
+        recent_flow = self.flow_history[-min(5, len(self.flow_history)):]
+        avg_horizontal_ratio = np.mean([f['horizontal_ratio'] for f in recent_flow]) if recent_flow else 0.5
+        
+        # 车身/消失点/流模式快速侧向触发
+        recent_car = self.car_region_history[-1] if self.car_region_history else {}
+        recent_vanish = self.vanish_history[-1] if self.vanish_history else {}
+        recent_flow_pattern = self.flow_pattern_history[-1] if self.flow_pattern_history else {}
+
+        if recent_car and recent_car.get('side', 0) > 0.5 and recent_vanish.get('side', 0) > 0.45:
+            result = "侧面视角"
+            self._check_and_lock(result, avg_forward, avg_side, avg_confidence)
+            return result
+        if recent_car and recent_car.get('side', 0) > 0.5 and recent_flow_pattern.get('side', 0) > 0.5:
+            result = "侧面视角"
+            self._check_and_lock(result, avg_forward, avg_side, avg_confidence)
+            return result
+        if recent_flow_pattern and recent_flow_pattern.get('side', 0) > 0.6 and avg_horizontal_ratio > 1.0:
+            result = "侧面视角"
+            self._check_and_lock(result, avg_forward, avg_side, avg_confidence)
+            return result
+        if recent_vanish and recent_vanish.get('side', 0) > 0.6:
+            result = "侧面视角"
+            self._check_and_lock(result, avg_forward, avg_side, avg_confidence)
+            return result
+
+        # 车身强推侧向：当车身侧向>0.55 且当前侧向得分≥前向 - 0.15 即侧向
+        if recent_car and recent_car.get('side', 0) > 0.55 and avg_side + 0.15 >= avg_forward:
+            result = "侧面视角"
+            self._check_and_lock(result, avg_forward, avg_side, avg_confidence)
+            return result
+
+        # 基于静态和动态特征的判断
+        # 强化侧面视角识别（需要同时满足右缘静态边+明显横向流）
+        if has_static_edge and avg_horizontal_ratio > 1.08:
+            result = "侧面视角"
+            self._check_and_lock(result, avg_forward, avg_side, avg_confidence)
+            return result
+        
+        # 强化正面视角识别（无右缘静态边且横向流弱）
+        if not has_static_edge and avg_horizontal_ratio < 0.98:
+            result = "前向视角"
+            self._check_and_lock(result, avg_forward, avg_side, avg_confidence)
+            return result
+
+
+        
+        # 基于得分差异的判断
+        diff = avg_forward - avg_side
+        
+        if diff > 0.07:
+            result = "前向视角"
+            self._check_and_lock(result, avg_forward, avg_side, avg_confidence)
+            return result
+        elif diff < -0.07:
+            result = "侧面视角"
+            self._check_and_lock(result, avg_forward, avg_side, avg_confidence)
+            return result
+        elif diff > 0.008:
+            result = "前向视角"
+            self._check_and_lock(result, avg_forward, avg_side, avg_confidence)
+            return result
+        elif diff < -0.008:
+            result = "侧面视角"
+            self._check_and_lock(result, avg_forward, avg_side, avg_confidence)
+            return result
+        else:
+            return "分析中..."
+
+
+
+    
+    def _check_and_lock(self, perspective, forward_score, side_score, confidence):
+        """检查并锁定视角"""
+        if perspective == self.last_result:
+            self.confident_frames += 1
+        else:
+            self.confident_frames = 1
+        
+        if self.confident_frames >= self.required_confident_frames and confidence > 0.1:
+            self.locked_perspective = perspective
+            print(f"视角已锁定为: {perspective} (连续{self.confident_frames}帧确信，置信度: {confidence:.2f})")
+        
+        self.last_result = perspective
+    
+    def get_debug_info(self):
+        """获取调试信息"""
+        if not self.confidence_history:
+            return {}
+        
+        recent_conf = self.confidence_history[-1]
+        recent_edge = self.edge_history[-1] if self.edge_history else {}
+        recent_flow = self.flow_history[-1] if self.flow_history else {}
+        
+        return {
+            'has_static_edge': recent_edge.get('has_static_edge', False),
+            'edge_density': recent_edge.get('edge_density', 0),
+            'vertical_edge_density': recent_edge.get('vertical_edge_density', 0),
+            'horizontal_ratio': recent_flow.get('horizontal_ratio', 0),
+            'forward_score': recent_conf.get('forward_score', 0),
+            'side_score': recent_conf.get('side_score', 0),
+            'confidence': recent_conf.get('confidence', 0),
+            'locked': bool(self.locked_perspective),
+            'locked_perspective': self.locked_perspective if self.locked_perspective else "未锁定",
+            'frame_count': self.frame_count
+        }
+
+
 # ==================================================================================
 # === 5. 核心视频处理线程 (视频读取、预处理、YOLO 推理与预警) ===
 # ==================================================================================
 class VideoThread(QtCore.QThread):
-    # 修改信号签名：发送四张图像 (Original, Preprocessed, Inference, BEV)
-    frame_signal = QtCore.pyqtSignal(QtGui.QImage, QtGui.QImage, QtGui.QImage, QtGui.QImage)
+    # 修改信号签名：发送三张图像 (Original, Preprocessed, Inference)
+    frame_signal = QtCore.pyqtSignal(QtGui.QImage, QtGui.QImage, QtGui.QImage)
     status_signal = QtCore.pyqtSignal(str)
 
     ttc_signal = QtCore.pyqtSignal(float, int)
@@ -178,36 +938,21 @@ class VideoThread(QtCore.QThread):
         self.model_name = os.path.basename(model_path)
         self.weak_conf_threshold = float(weak_conf_threshold)
         self.edge_strength_threshold = float(edge_strength_threshold)
-        
-        # 使用全局日志记录器
-        SYSTEM_LOGGER.info(f"VideoThread | 视频：{self.source} | 模型：{self.model_name}")
-        
         self._running = True
         self._frame_count = 0
         self._last_centers = {}
         self._seen_counts = {}
         self.view_classifier = ViewClassifier()
+        self.side_detector = None
         self.current_perspective = "分析中..."
         self.perspective_locked = False
         self.last_perspective_time = 0
         self.perspective_debug = False
         self.last_debug_info = {}
-        self.front_detector = None
-        self.side_detector = None
-        self.front_alarm = FrontAlarm()
-        self.side_alarm = SideAlarm(camera_side="left")
-        self.audio_alarm = CollisionAlarm(frequency=2500, duration=80, interval=0.08)
-        
-        # 实时决策日志
-        from core.reasoning_logger import ReasoningLogger
-        self.reasoning_logger = ReasoningLogger()
-        # 添加测试日志
-        self.reasoning_logger.add_log("系统启动")
+        self.forward_calculator = None
         
         # IPM & 轨迹评估
-        self.ipm = IPM_Transformer()  # 前向 IPM
-        self.side_ipm = get_side_ipm("left")  # 侧面 IPM（支持左右切换）
-        self.current_ipm = self.ipm  # 当前使用的 IPM
+        self.ipm = IPM_Transformer()
         self._world_history = {}
         self.vehicle_width = 1.9  # 车辆宽度 (m)
         self.envelope_margin = 0.4  # 包络线左右冗余 (m)
@@ -236,7 +981,7 @@ class VideoThread(QtCore.QThread):
         self.total_frames = 0
         self.duration = 0.0
         self._fps_ema = None
-        
+
         # ---------- 中文字体路径设置 ----------
 
 
@@ -336,8 +1081,6 @@ class VideoThread(QtCore.QThread):
             "toothbrush": "牙刷"
         }
 
-
-
     def _cv2_put_chinese(self, img, text, org, font_size, color):
         """
         单条绘制（作为兼容保留，但内部应优先使用批量绘制）
@@ -371,90 +1114,18 @@ class VideoThread(QtCore.QThread):
             draw_obj.text(org, text, font=font, fill=color[::-1]) # BGR -> RGB
             
         return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-    
-    def _draw_reasoning_log(self, frame):
-        """
-        在画面右侧绘制实时决策日志
-        
-        绘制位置：画面右侧 300px 区域
-        视觉效果：黑色半透明背景 + 逐行文字渲染
-        """
-        h, w = frame.shape[:2]
-        
-        # 定义日志区域
-        log_width = 300
-        log_x = w - log_width
-        log_y = 0
-        
-        # 获取日志数据
-        logs = self.reasoning_logger.get_logs()
-        
-        # 设置最大行数和行高
-        max_lines = 15
-        line_height = 16
-        
-        # 绘制黑色半透明背景矩形 (Alpha=120) - 只覆盖实际文字区域
-        overlay = frame.copy()
-        
-        # 计算需要显示的行数
-        num_lines = min(len(logs), max_lines)
-        if num_lines > 0:
-            # 计算背景高度（包含边距）
-            bg_height = num_lines * line_height + 20
-            bg_y1 = h - bg_height - 10
-            bg_y2 = h - 10
-            
-            # 只绘制覆盖文字区域的矩形
-            cv2.rectangle(overlay, (log_x, bg_y1), (w, bg_y2), (0, 0, 0), -1)
-            alpha = 120 / 255.0  # 透明度
-            cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-        
-        # 使用 PIL 绘制中文字符
-        from PIL import Image, ImageDraw, ImageFont
-        import numpy as np
-        
-        # OpenCV -> PIL
-        img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        draw_obj = ImageDraw.Draw(img_pil)
-        
-        # 字体设置
-        font_size = 12
-        text_color = (255, 255, 255)  # 白色
-        shadow_color = (0, 0, 0)      # 黑色阴影
-        
-        # 计算起始位置（从底部开始）
-        start_y = h - 20
-        
-        # 绘制文字（新日志显示在底部）
-        for i, log in enumerate(reversed(logs)):
-            if i >= max_lines:
-                break
-                
-            y = start_y - i * line_height
-            if y < 20:
-                break
-                
-            try:
-                # 尽量复用字体对象
-                if self.cached_font and self.cached_font.size == font_size:
-                    font = self.cached_font
-                else:
-                    font = ImageFont.truetype(self.font_path, font_size)
-                
-                # 绘制阴影
-                draw_obj.text((log_x + 9, y + 1), log, font=font, fill=shadow_color)
-                # 绘制文字
-                draw_obj.text((log_x + 8, y), log, font=font, fill=text_color)
-            except Exception:
-                # 字体加载失败时使用默认字体
-                font = ImageFont.load_default()
-                draw_obj.text((log_x + 9, y + 1), log, font=font, fill=shadow_color)
-                draw_obj.text((log_x + 8, y), log, font=font, fill=text_color)
-        
-        # PIL -> OpenCV
-        frame[:] = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-
+    def _draw_l_corners(self, frame, x1, y1, x2, y2, color, thickness=2, seg=16):
+        # 绘制四个角的L型线段
+        pts = [
+            ((x1, y1), (x1 + seg, y1)), ((x1, y1), (x1, y1 + seg)),
+            ((x2, y1), (x2 - seg, y1)), ((x2, y1), (x2, y1 + seg)),
+            ((x1, y2), (x1 + seg, y2)), ((x1, y2), (x1, y2 - seg)),
+            ((x2, y2), (x2 - seg, y2)), ((x2, y2), (x2, y2 - seg)),
+        ]
+        for p1, p2 in pts:
+            cv2.line(frame, p1, p2, color, thickness)
+        return frame
 
     # --- 绘图辅助工具 ---
     def _update_world_track(self, track_id, world_pos, max_len=20):
@@ -533,65 +1204,6 @@ class VideoThread(QtCore.QThread):
         angle_cost = abs(yaw_deg) / 180.0  # 夹角代价，用于平滑/抑制抖动
         return intent, yaw_deg, angle_cost
 
-    def _draw_bev(self, bev_objects):
-        """
-        绘制俯视图 (Bird's Eye View)
-        bev_objects: list of (world_pos (X, Y), class_name, risk_level)
-        """
-        # 画布设置：300x400, 1米 = 10像素
-        bev_w, bev_h = 300, 400
-        bev_img = np.zeros((bev_h, bev_w, 3), dtype=np.uint8) + 25  # 深灰色背景
-        
-        # 比例尺与坐标原点 (本车中心位于下方)
-        scale = 10.0 # 10px / m
-        origin_x = bev_w // 2
-        origin_y = bev_h - 50 # 留点底边给本车看后面
-        
-        # 1. 绘制网格线 (5米一格)
-        for d in range(0, 45, 5):
-            y = origin_y - int(d * scale)
-            if 0 <= y < bev_h:
-                cv2.line(bev_img, (0, y), (bev_w, y), (50, 50, 50), 1)
-                cv2.putText(bev_img, f"{d}m", (5, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1)
-        
-        # 2. 绘制本车 (Ego Vehicle)
-        ego_w = int(self.vehicle_width * scale)
-        ego_l = int(4.5 * scale) # 假设车长 4.5m
-        cv2.rectangle(bev_img, 
-                      (origin_x - ego_w // 2, origin_y - ego_l),
-                      (origin_x + ego_w // 2, origin_y), 
-                      (100, 100, 255), -1) # 蓝色本车
-        cv2.putText(bev_img, "SELF", (origin_x - 15, origin_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 255), 1)
-
-        # 3. 绘制检测到的目标
-        color_map = {
-            "car": (255, 150, 0),     # 橙色
-            "truck": (200, 100, 0),   # 深橙
-            "bus": (200, 100, 0),
-            "motorcycle": (0, 0, 255), # 红色 (重点)
-            "bicycle": (0, 150, 255), # 浅蓝
-            "person": (0, 255, 0)      # 绿色
-        }
-        
-        for world_pos, class_name, risk_level in bev_objects:
-            # X, Y (世界坐标: X右正, Y前正) -> 图像坐标
-            img_x = origin_x + int(world_pos[0] * scale)
-            img_y = origin_y - int(world_pos[1] * scale)
-            
-            if 0 <= img_x < bev_w and 0 <= img_y < bev_h:
-                color = color_map.get(class_name, (200, 200, 200))
-                # 如果有风险，强制变红加粗
-                if risk_level > 0:
-                    cv2.circle(bev_img, (img_x, img_y), 10, (0, 0, 255), 2)
-                
-                # 绘制目标点
-                cv2.circle(bev_img, (img_x, img_y), 6, color, -1)
-                # 绘制简短类名
-                label = class_name[:3].upper()
-                cv2.putText(bev_img, label, (img_x + 8, img_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
-
-        return bev_img
-
 
     # --- 核心主循环 ---
     def run(self):
@@ -608,9 +1220,7 @@ class VideoThread(QtCore.QThread):
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.duration = self.total_frames / self.fps if self.total_frames > 0 else 0.0
 
-        # 初始化碰撞检测器
-        self.front_detector = FrontCollisionDetector(self.fps)
-        self.side_detector = SideCollisionDetector(self.fps, logger=self.reasoning_logger)
+        self.forward_calculator = TTCCalculator(self.fps)
 
         if not os.path.exists(self.model_path):
             model_filename = os.path.basename(self.model_path)
@@ -641,7 +1251,10 @@ class VideoThread(QtCore.QThread):
         last_results = None
         deferred_draws = []
         while self._running:
-            just_seeked = False
+            if self._user_paused and not self._seeking:
+                time.sleep(0.05)
+                continue
+
             if self._seek_target is not None and self.cap:
                 target = max(0, int(self._seek_target))
                 if self.total_frames > 0:
@@ -649,34 +1262,11 @@ class VideoThread(QtCore.QThread):
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
                 self._frame_count = target
                 self._seek_target = None
-                just_seeked = True
-
-            if self._user_paused and not self._seeking and not just_seeked:
-                time.sleep(0.05)
-                continue
-
-            if self._seeking:
-                ret, frame = self.cap.read()
-                if ret:
-                    rgb_preview = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    ph, pw = rgb_preview.shape[:2]
-                    qimg_p = QtGui.QImage(rgb_preview.data, pw, ph, pw * 3, QtGui.QImage.Format_RGB888)
-                    bev_empty = np.zeros((400, 300, 3), dtype=np.uint8) + 20
-                    qimg_bev = QtGui.QImage(bev_empty.data, 300, 400, 300 * 3, QtGui.QImage.Format_RGB888)
-                    self.frame_signal.emit(qimg_p.copy(), qimg_p.copy(), qimg_p.copy(), qimg_bev.copy())
-                continue
 
             t_start = time.perf_counter()
             ret, frame = self.cap.read()
             if not ret:
-                # 播放结束时进入暂停状态，不退出线程，以便响应进度条回退
-                self._user_paused = True
-                if hasattr(self, 'audio_alarm') and self.audio_alarm:
-                    self.audio_alarm.cease()
-                if self._seek_target is not None:
-                    continue
-                time.sleep(0.1)
-                continue
+                break
 
             h, w = frame.shape[:2]
             # 初始化 IPM 内参（如果未设置）
@@ -776,26 +1366,24 @@ class VideoThread(QtCore.QThread):
             min_ttc = 99.0
             min_id = -1
 
-            # 动态检测引擎盖边缘并更新警示线位置
-            if self.current_perspective == "前向视角":
-                # 前向视角：使用 front_alarm 模块更新警示线位置
-                warning_line_y, detect_line_y = self.front_alarm.update_warning_lines(pre_gray, h, w)
-                warning_line_small_y = warning_line_y
-            else:
-                # 侧面视角：使用 side_alarm 模块更新警示线位置
-                warning_line_x, yellow_line_x = self.side_alarm.update_warning_lines(pre_gray, h, w)
-                # 为侧面视角设置默认值，避免后续代码出错
-                warning_line_y = int(h * 0.88)
-                warning_line_small_y = warning_line_y
-                detect_line_y = int(h * 0.40)
+            warning_line_y = int(h * 0.88)
+            warning_line_small_y = int(h * 0.88)
+            detect_line_y = int(h * 0.40)
 
-            # 绘制警示线/渐变
+            # 仅前向视角绘制警示线/渐变；侧向不画红/灰线
             if self.current_perspective == "前向视角":
-                # 前向视角：使用front_alarm模块绘制警示线
-                frame = self.front_alarm.draw_warning_lines(frame, h, w)
-            else:
-                # 侧面视角：使用side_alarm模块绘制警示线
-                frame = self.side_alarm.draw_warning_lines(frame, h, w)
+                grad_region = frame[warning_line_y:, :, :].astype(np.float32)
+                red = np.zeros_like(grad_region)
+                red[:, :, 2] = 255
+                if grad_region.shape[0] > 0:
+                    alpha = np.linspace(0.0, 0.35, grad_region.shape[0], dtype=np.float32)[:, None, None]
+                    blended = grad_region * (1 - alpha) + red * alpha
+                    frame[warning_line_y:, :, :] = blended.astype(np.uint8)
+
+                for x in range(0, w, 30):
+                    cv2.line(frame, (x, warning_line_y), (min(x + 18, w - 1), warning_line_y), (0, 0, 255), 4)
+                for x in range(0, w, 30):
+                    cv2.line(frame, (x, detect_line_y), (min(x + 16, w - 1), detect_line_y), (160, 160, 160), 2)
 
 
             # 实跳帧逻辑：每 2 帧进行一次推理
@@ -820,7 +1408,6 @@ class VideoThread(QtCore.QThread):
             bikes = []
             dx_list = []
             dy_list = []
-            bev_data = [] # 记录投影点
             if results:
                 boxes = results[0].boxes
                 if boxes is not None and len(boxes) > 0:
@@ -833,8 +1420,7 @@ class VideoThread(QtCore.QThread):
                         conf_score = float(box.conf[0]) if box.conf is not None else 0.0
                         xyxy = box.xyxy[0].cpu().numpy().astype(int)
                         x1, y1, x2, y2 = xyxy
-                        # 只在前向视角下使用检测线过滤
-                        if self.current_perspective == "前向视角" and y2 <= detect_line_y:
+                        if y2 <= detect_line_y:
                             continue
                         cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
                         class_name = name_map.get(cls_id, "")
@@ -922,11 +1508,11 @@ class VideoThread(QtCore.QThread):
                     self.last_perspective_time = current_time
                     
                     if self.current_perspective == "侧面视角":
+                        self.side_detector = SideCollisionDetector(w, h, fps_value)
                         self.status_signal.emit("侧向碰撞检测已启用")
-                        SYSTEM_LOGGER.info("切换到侧向视角，使用侧向碰撞检测器")
                     elif self.current_perspective == "前向视角":
+                        self.side_detector = None
                         self.status_signal.emit("前向碰撞检测已启用")
-                        SYSTEM_LOGGER.info("切换到前向视角，使用前向碰撞检测器")
                 
                 elif not self.perspective_locked:
                     perspective = self.view_classifier.determine_perspective()
@@ -935,45 +1521,6 @@ class VideoThread(QtCore.QThread):
                         self.perspective_signal.emit(perspective)
                         self.last_perspective_time = current_time
 
-            # 可视化调试：在检测到静止锚点时画红色实心方块（内存优化）
-            left_static = getattr(self.view_classifier, 'left_static', False)
-            right_static = getattr(self.view_classifier, 'right_static', False)
-            if left_static or right_static:
-                try:
-                    overlay = frame.copy()
-                    alpha = 0.5
-                    
-                    if left_static:
-                        # 左侧静止：画红色实心方块
-                        rect_x = int(w * 0.05)
-                        rect_y = int(h * 0.3)
-                        rect_w = int(w * 0.1)
-                        rect_h = int(h * 0.2)
-                        cv2.rectangle(overlay, (rect_x, rect_y), (rect_x + rect_w, rect_y + rect_h), (0, 0, 255), -1)
-                    
-                    if right_static:
-                        # 右侧静止：画红色实心方块
-                        rect_x = int(w * 0.75)
-                        rect_y = int(h * 0.3)
-                        rect_w = int(w * 0.1)
-                        rect_h = int(h * 0.2)
-                        cv2.rectangle(overlay, (rect_x, rect_y), (rect_x + rect_w, rect_y + rect_h), (0, 0, 255), -1)
-                    
-                    # 一次性混合
-                    cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
-                    
-                    # 绘制边框
-                    if left_static:
-                        cv2.rectangle(frame, (rect_x, rect_y), (rect_x + rect_w, rect_y + rect_h), (0, 0, 255), 2)
-                    if right_static:
-                        rect_x = int(w * 0.75)
-                        rect_y = int(h * 0.3)
-                        rect_w = int(w * 0.1)
-                        rect_h = int(h * 0.2)
-                        cv2.rectangle(frame, (rect_x, rect_y), (rect_x + rect_w, rect_y + rect_h), (0, 0, 255), 2)
-                finally:
-                    del overlay  # 立即释放内存
-
             # 在图像上显示视角状态（中文）
             view_text = self.current_perspective
             if self.perspective_locked:
@@ -981,181 +1528,61 @@ class VideoThread(QtCore.QThread):
             deferred_draws.append((view_text, (w - 360, 40), 32, (255, 255, 255)))
 
             # 根据视角类型选择不同的碰撞检测逻辑
-            min_ttc_alert = 99.0
-            min_id_alert = -1
-            closest_side_dist = 99.0  # 追踪最近侧向距离
-            
-            # 根据视角选择正确的 IPM
             if self.current_perspective == "侧面视角":
-                # 侧面视角：使用侧面 IPM，并根据相机侧切换
-                camera_side = self.side_alarm.camera_side if self.side_alarm else "left"
-                self.side_ipm = switch_side_ipm(camera_side)
-                self.current_ipm = self.side_ipm
-            else:
-                # 前向视角：使用前向 IPM
-                self.current_ipm = self.ipm
-            
-            for track_id, x1, y1, x2, y2, cx, cy, class_name in infos:
-                # 侧面视角不需要检测线过滤
-                width = max(1, x2 - x1)
-                height = max(1, y2 - y1)
-                if height / max(1, width) > 3.0 or width / max(1, height) > 4.0:
-                    continue
-                area_ratio = (width * height) / max(1, w * h)
-                # 只在前向视角下使用警告线
-                if self.current_perspective == "前向视角":
-                    warn_line = warning_line_small_y if class_name in {"bicycle", "motorcycle", "person"} else warning_line_y
-                else:
-                    warn_line = None
-                
-                # 获取物体距离 (双目模式)
-                obj_dist = None
-                if self.stereo_mode and self.disparity_map is not None:
-                    # 在检测框中心区域取平均视差
-                    mask_y1, mask_y2 = max(0, y1), min(h, y2)
-                    mask_x1, mask_x2 = max(0, x1), min(w, x2)
-                    roi_disp = self.disparity_map[mask_y1:mask_y2, mask_x1:mask_x2]
-                    valid_disp = roi_disp[roi_disp > 0]
-                    if len(valid_disp) > 0:
-                        avg_disp = np.median(valid_disp)
-                        if avg_disp > 0:
-                            obj_dist = (self.focal_length * self.baseline) / avg_disp
-                else:
-                    # 单目近似距离：使用检测框高度估距（假设目标高度常数 H_obj）
-                    H_obj_map = {
-                        "car": 1.5,
-                        "truck": 2.5,
-                        "bus": 3.0,
-                        "motorcycle": 1.4,
-                        "bicycle": 1.4,
-                        "person": 1.7,
-                    }
-                    est_h = H_obj_map.get(class_name, 1.6)
-                    bbox_h = max(1, y2 - y1)
-                    obj_dist = (est_h * self.focal_length) / bbox_h
+                frame = self._process_side_ipm(frame, infos, w, h, fps_value, deferred_draws)
+            elif self.current_perspective == "前向视角":
 
-                world_pos = None
-                intent = "直行通过"
-                yaw_deg = 0.0
-                angle_cost = 0.0
+                min_ttc_alert = 99.0
+                min_id_alert = -1
                 
-                # 根据视角选择不同的碰撞检测逻辑
-                if self.current_perspective == "侧面视角":
-                    # 侧向视角：使用侧面碰撞检测器
-                    lateral_state = None
-                    debug_info = ""
+                for track_id, x1, y1, x2, y2, cx, cy, class_name in infos:
+                    if y2 <= detect_line_y:
+                        continue
+                    width = max(1, x2 - x1)
+                    height = max(1, y2 - y1)
+                    if height / max(1, width) > 3.0 or width / max(1, height) > 4.0:
+                        continue
+                    area_ratio = (width * height) / max(1, w * h)
+                    warn_line = warning_line_small_y if class_name in {"bicycle", "motorcycle", "person"} else warning_line_y
                     
-                    # ========== 新增：画面正下方近距离直接报警逻辑 ==========
-                    # 当车辆非常靠近（检测框很大）且在画面底部中心区域时，直接报警
-                    bbox_width = x2 - x1    
-                    bbox_height = y2 - y1
-                    bottom_y = max(y1, y2)
-                    
-                    # 计算检测框中心点x坐标
-                    bbox_cx = (x1 + x2) // 2
-                    
-                    # 判断检测框中心是否靠近图像中心水平线（距离中心不超过40%图像宽度）
-                    near_center_x = abs(bbox_cx - w // 2) < (w * 0.40)
-                    # 判断检测框是否足够大（宽度超过图像宽度的30%或高度超过图像高度的40%）
-                    large_bbox = (bbox_width > w * 0.30) or (bbox_height > h * 0.40)
-                    # 判断检测框是否靠近车身一侧（根据相机侧）
-                    if self.side_ipm and self.side_ipm.camera_side == "left":
-                        # 左相机：车身在右侧，检测框右侧应靠近图像右边缘
-                        near_vehicle_side = x2 > w * 0.6
+                    # 获取物体距离 (双目模式)
+                    obj_dist = None
+                    if self.stereo_mode and self.disparity_map is not None:
+                        # 在检测框中心区域取平均视差
+                        mask_y1, mask_y2 = max(0, y1), min(h, y2)
+                        mask_x1, mask_x2 = max(0, x1), min(w, x2)
+                        roi_disp = self.disparity_map[mask_y1:mask_y2, mask_x1:mask_x2]
+                        valid_disp = roi_disp[roi_disp > 0]
+                        if len(valid_disp) > 0:
+                            avg_disp = np.median(valid_disp)
+                            if avg_disp > 0:
+                                obj_dist = (self.focal_length * self.baseline) / avg_disp
                     else:
-                        # 右相机：车身在左侧，检测框左侧应靠近图像左边缘
-                        near_vehicle_side = x1 < w * 0.4
-                    
-                    immediate_alarm = near_center_x and large_bbox and near_vehicle_side
-                    
-                    if self.side_ipm and not immediate_alarm:
-                        # 使用靠近车身一侧的底角点进行 IPM 转换
-                        corner_u, corner_v = self.side_ipm.get_side_corner_point(x1, y1, x2, y2)
-                        world_pos = self.side_ipm.pixel_to_ground(corner_u, corner_v, (h, w))
-                        used_corner = True
-                        
-                        # 如果底角点 IPM 失败，尝试使用底边中心点作为备用
-                        if world_pos is None:
-                            center_x = (x1 + x2) // 2
-                            bottom_y = max(y1, y2)
-                            world_pos = self.side_ipm.pixel_to_ground(center_x, bottom_y, (h, w))
-                            used_corner = False
-                        if world_pos is not None:
-                            x_ground, y_ground = world_pos
-                            corner_tag = "C" if used_corner else "M"  # C=角点, M=中点
-                            debug_info = f"X:{x_ground:.1f}m{corner_tag}"
-                            self._update_world_track(track_id, world_pos)
-                            intent, yaw_deg, angle_cost = self._predict_intent(track_id, world_pos)
-                                                # 使用侧面碰撞检测器
-                            if self.side_detector:
-                                lateral_state = self.side_detector.update(
-                                    track_id,
-                                    world_pos,
-                                    class_name,
-                                    self.v_self_mps
-                                )
-                                if lateral_state:
-                                    debug_info = f"X:{lateral_state.distance_x:.1f}m{corner_tag} R:{lateral_state.risk_level}"
-                                else:
-                                    # 获取详细调试信息
-                                    target_state = self.side_detector.get_target_state(track_id)
-                                    if target_state:
-                                        seen_frames = target_state.get('seen_frames', 0)
-                                        vx_ema = target_state.get('vx_ema', 0)
-                                        x_hist = target_state.get('x_history', [])
-                                        y_hist = target_state.get('y_history', [])
-                                        y_val = y_hist[-1] if y_hist else 0
-                                        debug_info = f"X:{x_ground:.1f}m Y:{y_val:.1f}m F:{seen_frames} VX:{vx_ema:.2f}"
-                                    else:
-                                        debug_info = f"X:{x_ground:.1f}m NO_TRACK"
-                        else:
-                            # IPM 完全失败，显示尝试过的点
-                            center_x = (x1 + x2) // 2
-                            bottom_y_val = max(y1, y2)
-                            debug_info = f"IPM_FAIL({corner_u},{corner_v})&({center_x},{bottom_y_val})"
-                    elif immediate_alarm:
-                        # 直接报警模式：不依赖 IPM，基于图像特征直接判定
-                        debug_info = f"IMMEDIATE_ALARM"
-                        risk_level = 2
-                        in_path = True
-                        red_allowed = True
-                        ttc = 0.5  # 极短 TTC
-                        vx = 0.0
-                        vy = 0.0
-                        is_static = False
-                        dw_dt = 0.0
-                        vw = 0.0
-                        # 极近距离直接突破壁垒
-                        closest_side_dist = min(closest_side_dist, 0.5)
-                    else:
-                        debug_info = "NO_IPM"
-                    if not immediate_alarm:
-                        
-                        if lateral_state:
-                            ttc = lateral_state.ttl_lateral
-                            vx = lateral_state.vx
-                            vy = lateral_state.vy
-                            is_static = lateral_state.is_static
-                            risk_level = lateral_state.risk_level
-                            in_path = True 
-                            red_allowed = True
-                            dw_dt = 0.0
-                            vw = 0.0
-                            
-                            # 更新最近的主体距离用于侧向壁垒渲染
-                            closest_side_dist = min(closest_side_dist, lateral_state.distance_x)
-                       # 强制在标签中显示调试信息
-                    label = f"[{track_id}] {class_name} {debug_info}"
-                else:
-                    # 前向视角：使用正面碰撞检测器
-                    if self.current_ipm:
-                        world_pos = self.current_ipm.pixel_to_ground(cx, y2, (h, w))
+                        # 单目近似距离：使用检测框高度估距（假设目标高度常数 H_obj）
+                        H_obj_map = {
+                            "car": 1.5,
+                            "truck": 2.5,
+                            "bus": 3.0,
+                            "motorcycle": 1.4,
+                            "bicycle": 1.4,
+                            "person": 1.7,
+                        }
+                        est_h = H_obj_map.get(class_name, 1.6)
+                        bbox_h = max(1, y2 - y1)
+                        obj_dist = (est_h * self.focal_length) / bbox_h
+
+                    world_pos = None
+                    intent = "直行通过"
+                    yaw_deg = 0.0
+                    angle_cost = 0.0
+                    if self.ipm:
+                        world_pos = self.ipm.pixel_to_ground(cx, y2, (h, w))
                         if world_pos is not None:
                             self._update_world_track(track_id, world_pos)
                             intent, yaw_deg, angle_cost = self._predict_intent(track_id, world_pos)
                     
-                    # 使用正面碰撞检测器
-                    ttc, vx, vy, dw_dt, red_allowed, vw, is_static, risk_level, in_path = self.front_detector.update(
+                    ttc, vx, vy, dw_dt, red_allowed, vw, is_static, risk_level, in_path = self.forward_calculator.update(
+
                         track_id,
                         width,
                         cx,
@@ -1174,167 +1601,115 @@ class VideoThread(QtCore.QThread):
                         d_safe=self.d_safe,
                     )
 
-                v_rel = None
-                sdt_violation = False
-                safe_dist = None
-                vx_abs = abs(vx)
-                if obj_dist is not None:
-                    prev_dist = self._last_distance.get(track_id)
-                    t_react_use = 0.8 if self.current_perspective == "侧面视角" else self.t_reaction
+                    v_rel = None
+                    sdt_violation = False
+                    safe_dist = None
+                    vx_abs = abs(vx)
+                    if obj_dist is not None:
 
-                    if prev_dist is not None:
-                        v_rel = (prev_dist - obj_dist) * fps_value  # m/s，正值代表在接近
-                        hist = self._vrel_history.get(track_id, [])
-                        hist = (hist + [v_rel])[-6:]
-                        self._vrel_history[track_id] = hist
-                        continuous_closing = len(hist) >= 5 and all(v > 0 for v in hist[-5:])
+                        prev_dist = self._last_distance.get(track_id)
+                        t_react_use = 0.8 if self.current_perspective == "侧面视角" else self.t_reaction
 
-                        safe_dist = v_rel * t_react_use + self.d_safe
-                        lane_center_ok = (w * 0.35) <= cx <= (w * 0.65)
-                        is_vehicle = class_name in {"car", "truck", "bus"}
-                        v_rel_avg = sum(hist[-5:]) / 5.0 if len(hist) >= 5 else v_rel
-                        sdt_gate = (lane_center_ok or is_vehicle) and continuous_closing and (v_rel_avg is not None and v_rel_avg > 0.5)
+                        if prev_dist is not None:
+                            v_rel = (prev_dist - obj_dist) * fps_value  # m/s，正值代表在接近
+                            hist = self._vrel_history.get(track_id, [])
+                            hist = (hist + [v_rel])[-6:]
+                            self._vrel_history[track_id] = hist
+                            continuous_closing = len(hist) >= 5 and all(v > 0 for v in hist[-5:])
 
-                        lateral_only = vx_abs > (abs(vw) + 1e-3) * 1.5
-                        # 只在前向视角下使用警告线
-                        if self.current_perspective == "前向视角":
+                            safe_dist = v_rel * t_react_use + self.d_safe
+                            lane_center_ok = (w * 0.35) <= cx <= (w * 0.65)
+                            is_vehicle = class_name in {"car", "truck", "bus"}
+                            v_rel_avg = sum(hist[-5:]) / 5.0 if len(hist) >= 5 else v_rel
+                            sdt_gate = (lane_center_ok or is_vehicle) and continuous_closing and (v_rel_avg is not None and v_rel_avg > 0.5)
+
+                            lateral_only = vx_abs > (abs(vw) + 1e-3) * 1.5
                             near_line = y2 > warning_line_y
-                        else:
-                            near_line = True
 
-                        if sdt_gate and near_line and not lateral_only and v_rel is not None and v_rel > 1.0 and ttc > 0 and obj_dist < safe_dist:
-                            prev_center = self._last_centers.get(track_id)
-                            cy_prev = prev_center[1] if prev_center else cy
-                            if abs(cy - cy_prev) < 1.0 and cy < h * 0.4:
-                                sdt_violation = False
-                            else:
-                                sdt_violation = True
-                    self._last_distance[track_id] = obj_dist
-                else:
-                    self._last_distance.pop(track_id, None)
-                    self._vrel_history.pop(track_id, None)
+                            if sdt_gate and near_line and not lateral_only and v_rel is not None and v_rel > 1.0 and ttc > 0 and obj_dist < safe_dist:
+                                prev_center = self._last_centers.get(track_id)
+                                cy_prev = prev_center[1] if prev_center else cy
+                                if abs(cy - cy_prev) < 1.0 and cy < h * 0.4:
+                                    sdt_violation = False
+                                else:
+                                    sdt_violation = True
+                        self._last_distance[track_id] = obj_dist
+                    else:
+                        self._last_distance.pop(track_id, None)
+                        self._vrel_history.pop(track_id, None)
 
-                safe_glance = False
-                if world_pos is not None:
-                    conflict = self._in_conflict_envelope(track_id, world_pos)
-                    if not conflict:
-                        safe_glance = True
-                if safe_glance:
-                    risk_level = 0
+                    safe_glance = False
+                    if world_pos is not None:
+                        conflict = self._in_conflict_envelope(track_id, world_pos)
+                        if not conflict:
+                            safe_glance = True
+                    if safe_glance:
+                        risk_level = 0
 
-                if angle_cost > 0.25 and risk_level > 0:
-                    risk_level = max(0, risk_level - 1)
-                
-                # 只在前向视角下使用过滤逻辑，侧面视角不过滤
-                if self.current_perspective == "前向视角":
+                    if angle_cost > 0.25 and risk_level > 0:
+                        risk_level = max(0, risk_level - 1)
+                    
                     if self._seen_counts.get(track_id, 0) < 5:
                         continue
                     if is_static:
                         continue
 
-                ratio = vx_abs / max(vw, 1e-3)
-                center_relaxed = (w * 0.35) <= cx <= (w * 0.65)
-                ratio_threshold = 0.9 if center_relaxed else 0.9
+                    ratio = vx_abs / max(vw, 1e-3)
+                    center_relaxed = (w * 0.35) <= cx <= (w * 0.65)
+                    ratio_threshold = 0.9 if center_relaxed else 0.9
 
-                lateral_fast = ratio > ratio_threshold
-                red_ok = red_allowed and not lateral_fast
+                    lateral_fast = ratio > ratio_threshold
+                    red_ok = red_allowed and not lateral_fast
 
-                warn_ttc = 99.0 if safe_glance else ttc
-                # 只在前向视角下使用警告线
-                if self.current_perspective == "前向视角" and y2 <= warning_line_y:
-                    warn_ttc = 99.0
-                elif class_name in {"person", "bicycle", "motorcycle"} and ttc < 2.0 and not red_ok:
-                    warn_ttc = 2.0
-                elif ttc < 1.5 and not red_ok:
-                    warn_ttc = 1.5
+                    warn_ttc = 99.0 if safe_glance else ttc
+                    if y2 <= warn_line:
+                        warn_ttc = 99.0
 
-                sdt_tag = False
-                if sdt_violation:
-                    sdt_tag = True
-                    warn_ttc = min(warn_ttc, 1.0)
+                    elif class_name in {"person", "bicycle", "motorcycle"} and ttc < 2.0 and not red_ok:
+                        warn_ttc = 2.0
+                    elif ttc < 1.5 and not red_ok:
+                        warn_ttc = 1.5
 
-                if warn_ttc < min_ttc:
-                    min_ttc = warn_ttc
-                    min_id = track_id
+                    sdt_tag = False
+                    if sdt_violation:
+                        sdt_tag = True
+                        warn_ttc = min(warn_ttc, 1.0)
 
-                # 根据视角获取显示参数
-                if self.current_perspective == "前向视角":
-                    color, label, thickness = self.front_alarm.get_display_params(
-                        track_id, class_name, ttc, y2, warning_line_y, lateral_fast, red_ok
+                    if warn_ttc < min_ttc_alert:
+                        min_ttc_alert = warn_ttc
+                        min_id_alert = track_id
+
+                    # 前向视角显示参数
+                    color, label, thickness = self._get_forward_display_params(
+                        track_id, class_name, ttc, y2, warn_line, lateral_fast, red_ok
                     )
-                else:
-                    # 侧面视角：使用强制设置的标签（包含调试信息）
                     if risk_level == 2:
                         color = (0, 0, 255)
                         thickness = 3
                     elif risk_level == 1:
                         color = (0, 255, 255)
-                        thickness = 2
-                    else:
-                        color = (0, 255, 0)
-                        thickness = 2           
-                    # 确保 label 已定义（如果之前的代码路径没有设置，使用默认值）
-                    if 'label' not in locals():
-                        label = f"[{track_id}] {class_name}"
-                # 根据视角绘制L型角框
-                if self.current_perspective == "前向视角":
-                    frame = self.front_alarm.draw_l_corners(frame, x1, y1, x2, y2, color, thickness=thickness, seg=18)
+                        thickness = max(thickness, 2)
+
+                    if sdt_tag:
+                        if safe_dist is not None:
+                            label = f"SDT {safe_dist:.1f}m"
+                        else:
+                            label = label.replace("TTC", "SDT") if "TTC" in label else f"SDT {label}"
+                    if obj_dist is not None:
+                        label += f" {obj_dist:.1f}m"
+                    if v_rel is not None:
+                        label += f" v={v_rel:.1f}m/s"
+                    
+                    self._draw_l_corners(frame, x1, y1, x2, y2, color, thickness=thickness, seg=18)
+                    # 延迟绘制标签
                     deferred_draws.append((label, (x1, y1 - 35), 24, color))
-                else:
-                    frame = self.side_alarm.draw_l_corners(frame, x1, y1, x2, y2, color, thickness=thickness, seg=18)
-                    # 侧面视角：使用强制设置的标签
-                deferred_draws.append((label, (x1, y1 - 35), 24, color))
+
+                if min_ttc_alert < 1.5:
+                    if self._frame_count % 2 == 0:
+                        cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 8)
+                    self.log_signal.emit(min_id_alert, min_ttc_alert)
                 
-                # 收集 BEV 数据
-                if world_pos is not None:
-                    bev_data.append((world_pos, class_name, risk_level))
-
-            # 优化报警触发条件 - 提高阈值并增加确认机制
-            alarm_triggered = False
-            
-            if self.current_perspective == "前向视角":
-                # 前向视角：TTC < 1.2秒且风险等级为2才报警
-                if min_ttc < 1.2 and min_id >= 0:
-                    # 检查该目标的风险等级
-                    for track_id, x1, y1, x2, y2, cx, cy, class_name in infos:
-                        if track_id == min_id:
-                            # 重新获取该目标的检测参数
-                            width = max(1, x2 - x1)
-                            height = max(1, y2 - y1)
-                            area_ratio = (width * height) / max(1, w * h)
-                            
-                            # 调用检测器获取风险等级
-                            _, _, _, _, _, _, _, risk_level, _ = self.front_detector.update(
-                                track_id, width, cx, cy, y2, w, h, warning_line_y,
-                                area_ratio, global_vx, global_vy,
-                                distance=obj_dist if 'obj_dist' in locals() else None,
-                                v_self_mps=self.v_self_mps,
-                                t_reaction=self.t_reaction,
-                                d_safe=self.d_safe,
-                            )
-                            if risk_level >= 2:
-                                alarm_triggered = True
-                            break
-            else:
-                # 侧面视角：基于最近距离和壁垒突破
-                if closest_side_dist < 0.8:  # 突破0.8米壁垒
-                    alarm_triggered = True
-            
-            if alarm_triggered:
-                if self._frame_count % 2 == 0:
-                    cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 8)
-                self.log_signal.emit(min_id, min_ttc)
-                self.audio_alarm.trigger()
-            else:
-                self.audio_alarm.cease()
-            
-            self.ttc_signal.emit(min_ttc, min_id)
-
-            # === 侧壁渲染逻辑 ===
-            if self.current_perspective == "侧面视角" and self.side_alarm:
-                self.side_alarm.update_closest_distance(closest_side_dist)
-                self.side_alarm.update_wall_position(self.side_ipm, (h, w))
-                frame = self.side_alarm.draw_side_wall(frame, h, w, self._frame_count)
+                self.ttc_signal.emit(min_ttc_alert, min_id_alert)
 
             hud_payload = {
                 "fps": self._fps_ema if self._fps_ema is not None else fps_value,
@@ -1343,38 +1718,31 @@ class VideoThread(QtCore.QThread):
             }
             self.hud_signal.emit(hud_payload)
 
-            # 5. 批量执行中文绘制
+            # 5. 批量执行中文绘制 (核心优化)
             if deferred_draws:
                 frame = self._draw_batch_chinese(frame, deferred_draws)
                 deferred_draws = []
-            
-            # 绘制实时决策日志
-            self._draw_reasoning_log(frame)
 
-            # 1. Original View
+            # 1. Original View (frame_raw)
             rgb_orig = cv2.cvtColor(frame_raw, cv2.COLOR_BGR2RGB)
             h_orig, w_orig, ch_orig = rgb_orig.shape
             bytes_orig = ch_orig * w_orig
             qimage_orig = QtGui.QImage(rgb_orig.data, w_orig, h_orig, bytes_orig, QtGui.QImage.Format_RGB888)
 
-            # 2. Pre-processed View
+            # 2. Pre-processed View (Gray: CLAHE+Blur+Gray)
             h_pre, w_pre = pre_gray.shape[:2]
             bytes_pre = w_pre
             qimage_pre = QtGui.QImage(pre_gray.data, w_pre, h_pre, bytes_pre, QtGui.QImage.Format_Grayscale8)
 
-            # 3. Inference View (Final frame)
+
+            # 3. Inference View (Final frame with UI)
             rgb_inf = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h_inf, w_inf, ch_inf = rgb_inf.shape
             bytes_inf = ch_inf * w_inf
             qimage_inf = QtGui.QImage(rgb_inf.data, w_inf, h_inf, bytes_inf, QtGui.QImage.Format_RGB888)
 
-            # 4. Bird's Eye View (BEV)
-            bev_img = self._draw_bev(bev_data)
-            bev_rgb = cv2.cvtColor(bev_img, cv2.COLOR_BGR2RGB)
-            qimage_bev = QtGui.QImage(bev_rgb.data, 300, 400, 300 * 3, QtGui.QImage.Format_RGB888)
-
-            # 发送四路画面
-            self.frame_signal.emit(qimage_orig.copy(), qimage_pre.copy(), qimage_inf.copy(), qimage_bev.copy())
+            # 发送三路画面
+            self.frame_signal.emit(qimage_orig.copy(), qimage_pre.copy(), qimage_inf.copy())
 
             self.position_signal.emit(
                 current_frame_idx,
@@ -1400,23 +1768,192 @@ class VideoThread(QtCore.QThread):
         self.status_signal.emit("系统就绪")
 
 
+    # --- 视角专用处理逻辑 (侧向与正向显示) ---
+    def _process_side_ipm(self, frame, infos, w, h, fps_value, deferred_draws):
+        """侧向视角：基于 0.8m 碰撞壁垒的开门/侧侵预警"""
+        # 侧向敏感区：X 0~0.8m（贴车身），Y -2~10m（前 2m 至后 10m）
+        roi_rect = [(0.0, -2.0), (0.8, -2.0), (0.8, 10.0), (0.0, 10.0)]
+
+        wall_samples = []
+        car_edge_samples = []
+
+        if self.ipm:
+            # 绘制敏感区梯形
+            pts_roi = []
+            for X, Y in roi_rect:
+                pt = self.ipm.ground_to_pixel(X, Y, (h, w))
+                if pt:
+                    # 转换为整数坐标
+                    pts_roi.append((int(pt[0]), int(pt[1])))
+            if len(pts_roi) >= 3:
+                poly = np.array(pts_roi, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(frame, [poly], isClosed=True, color=(200, 180, 90), thickness=2, lineType=cv2.LINE_AA)
+
+            # 侧向碰撞壁垒：x=0.8m（右上至左下方向的虚线）
+            wall_pts = []
+            car_pts = []
+            for Y in np.linspace(-2.0, 10.0, 18):
+                pt_wall = self.ipm.ground_to_pixel(0.8, Y, (h, w))
+                pt_car = self.ipm.ground_to_pixel(0.0, Y, (h, w))
+                if pt_wall:
+                    # 转换为整数坐标
+                    wall_pts.append((int(pt_wall[0]), int(pt_wall[1])))
+                if pt_car:
+                    # 转换为整数坐标
+                    car_pts.append((int(pt_car[0]), int(pt_car[1])))
+            wall_samples = wall_pts
+            car_edge_samples = car_pts
+
+            if len(wall_pts) >= 2:
+                wall_pts_sorted = sorted(wall_pts, key=lambda p: p[1], reverse=True)
+                for i in range(0, len(wall_pts_sorted) - 1, 2):
+                    # 确保点是有效的整数坐标
+                    pt1 = wall_pts_sorted[i]
+                    pt2 = wall_pts_sorted[i + 1]
+                    if isinstance(pt1, tuple) and isinstance(pt2, tuple) and len(pt1) == 2 and len(pt2) == 2:
+                        cv2.line(frame, pt1, pt2, (240, 200, 0), 2, lineType=cv2.LINE_AA)
+
+        def _interp_x(points, y):
+            if not points:
+                return None
+            # 过滤掉无效点
+            valid_pts = [(int(p[0]), int(p[1])) for p in points if isinstance(p, (list, tuple)) and len(p) == 2]
+            if not valid_pts:
+                return None
+            pts = sorted(valid_pts, key=lambda p: p[1])
+            if y <= pts[0][1]:
+                return pts[0][0]
+            if y >= pts[-1][1]:
+                return pts[-1][0]
+            for i in range(len(pts) - 1):
+                y0, y1 = pts[i][1], pts[i + 1][1]
+                if y0 <= y <= y1:
+                    ratio = (y - y0) / max(y1 - y0, 1e-6)
+                    return pts[i][0] + ratio * (pts[i + 1][0] - pts[i][0])
+            return None
+
+        non_warning_band = int(w * 0.33)
+
+        for track_id, x1, y1, x2, y2, cx, cy, class_name in infos:
+            # 仅使用检测框最右边缘（x_max, y_max）作为锚点，禁止中心点
+            anchor_u, anchor_v = x2, y2
+
+            world_pos = None
+            if self.ipm:
+                world_pos = self.ipm.pixel_to_ground(anchor_u, anchor_v, (h, w))
+                if world_pos is not None:
+                    self._update_world_track(track_id, world_pos, max_len=20)
+
+            closure_x = 0.0
+            distance_x = None
+            distance_y = None
+            if world_pos is not None:
+                history = self._world_history.get(track_id, [])
+                distance_x = abs(world_pos[0])
+                distance_y = world_pos[1]
+                if len(history) >= 2:
+                    prev = history[-2]
+                    curr = history[-1]
+                    closure_x = (abs(prev[0]) - abs(curr[0])) * fps_value
+
+            # 基于 0.8m 物理墙 + 像素阈线（倾斜虚线）双重判断
+            wall_x = _interp_x(wall_samples, anchor_v)
+            car_x = _interp_x(car_edge_samples, anchor_v)
+            inside_by_pixel = False
+            if wall_x is not None and anchor_u >= non_warning_band:
+                if car_x is not None:
+                    inside_by_pixel = anchor_u >= wall_x if car_x >= wall_x else anchor_u <= wall_x
+                else:
+                    inside_by_pixel = anchor_u >= wall_x
+
+            inside_by_world = distance_x is not None and distance_x < 0.8
+
+            far_enough = (distance_x is not None and distance_x >= 1.2) or (distance_x is None and anchor_u < non_warning_band)
+            pixel_trigger = inside_by_pixel and not far_enough
+            inside_wall = inside_by_world or pixel_trigger
+
+            chinese_class = self.class_map.get(class_name, class_name)
+            label = chinese_class
+            color = (0, 255, 0)
+            thickness = 2
+
+            vulnerable = class_name in {"bicycle", "motorcycle", "person"}
+            blink = (self._frame_count % 4) < 2
+
+            if far_enough:
+                label = f"安全 {distance_x:.2f}m" if distance_x is not None else chinese_class
+            elif inside_wall:
+                if vulnerable:
+                    color = (0, 0, 255) if blink else (0, 0, 120)
+                    thickness = 3
+                    label = f"近场开门警告 {distance_x:.2f}m" if distance_x is not None else "近场开门警告"
+                else:
+                    color = (0, 0, 255)
+                    thickness = 3
+                    label = f"碰撞壁垒内 {distance_x:.2f}m" if distance_x is not None else "碰撞壁垒内"
+                self.side_warning_signal.emit('danger', label, track_id)
+            else:
+                if closure_x > 0.3 and distance_x is not None and distance_x < 1.2:
+                    color = (0, 165, 255)
+                    thickness = 2
+                    label = f"靠近 {distance_x:.2f}m"
+                    self.side_warning_signal.emit('warning', label, track_id)
+                else:
+                    label = f"平行 {distance_x:.2f}m" if distance_x is not None else chinese_class
+
+            self._draw_l_corners(frame, x1, y1, x2, y2, color, thickness=2, seg=18)
+            deferred_draws.append((label, (x1, y1 - 35), 24, color))
+
+
+        return frame
 
 
 
 
+
+    def _get_forward_display_params(self, track_id, class_name, ttc, y2, warn_line, lateral_fast, red_ok):
+        """获取前向视角显示参数（中文）"""
+        chinese_class = self.class_map.get(class_name, class_name)
+        
+        if y2 <= warn_line:
+            color = (120, 120, 120)
+            label = f"{chinese_class} {track_id}" if track_id >= 0 else chinese_class
+            thickness = 2
+        elif class_name in {"bicycle", "motorcycle", "person"}:
+            color = (255, 0, 255)
+            label = f"{chinese_class} (注意)"
+            thickness = 3
+        elif lateral_fast and ttc < 3.0:
+            color = (255, 0, 0)
+            label = f"碰撞时间 {ttc:.1f}秒"
+            thickness = 2
+        elif class_name in {"person", "bicycle", "motorcycle"} and ttc < 2.0 and red_ok:
+            color = (0, 0, 255)
+            label = f"危险！碰撞时间 {ttc:.1f}秒"
+            thickness = 3
+        elif ttc < 1.5 and red_ok:
+            color = (0, 0, 255)
+            label = f"危险！碰撞时间 {ttc:.1f}秒"
+            thickness = 3
+        elif ttc < 3.0:
+            color = (0, 255, 255)
+            label = f"碰撞时间 {ttc:.1f}秒"
+            thickness = 2
+        else:
+            color = (0, 255, 0)
+            label = f"{chinese_class} {track_id}" if track_id >= 0 else chinese_class
+            thickness = 2
+        
+        return color, label, thickness
 
     def stop(self):
         self._running = False
         self._user_paused = False
         self._seeking = False
-        if hasattr(self, 'audio_alarm') and self.audio_alarm:
-            self.audio_alarm.destroy()
         self.wait()
 
     def set_paused(self, paused: bool):
         self._user_paused = paused
-        if paused and hasattr(self, 'audio_alarm') and self.audio_alarm:
-            self.audio_alarm.cease()
 
     def start_seek(self):
         self._seeking = True
@@ -1773,10 +2310,7 @@ class MainWindow(QtWidgets.QWidget):
         self.log_window = LogWindow(self)
         self.settings_window = SettingsWindow(self.weak_conf_threshold, self.edge_strength_threshold, self)
         self.settings_window.preprocess_changed.connect(self.update_preprocess_from_dialog)
-        
-        # 初始化SideAlarm（供视角切换按钮使用，实际逻辑在VideoThread中执行）
-        self.side_alarm = SideAlarm(camera_side="left")
-        
+
         self.setup_ui()
         self.apply_modern_theme()
         
@@ -2009,21 +2543,15 @@ class MainWindow(QtWidgets.QWidget):
         self.frame_orig, self.label_orig = create_view_frame("原始画面 // 摄像头 01")
         self.frame_pre, self.label_pre = create_view_frame("预处理 // 图像增强")
         self.frame_inf, self.label_inf = create_view_frame("AI 推理 // 目标检测", "#6366f1")
-        self.frame_bev, self.label_bev = create_view_frame("IPM 俯视图 // BEV", "#10b981")
 
-        # Layout: Top Row (Split) + Bottom Row (Split: Inference + BEV)
+        # Layout: Top Row (Split) + Bottom Row (Full)
         row1_layout = QtWidgets.QHBoxLayout()
         row1_layout.setSpacing(16)
         row1_layout.addWidget(self.frame_orig)
         row1_layout.addWidget(self.frame_pre)
 
-        row2_layout = QtWidgets.QHBoxLayout()
-        row2_layout.setSpacing(16)
-        row2_layout.addWidget(self.frame_inf, stretch=7)
-        row2_layout.addWidget(self.frame_bev, stretch=3)
-
         views_layout.addLayout(row1_layout, stretch=4)
-        views_layout.addLayout(row2_layout, stretch=6)
+        views_layout.addWidget(self.frame_inf, stretch=6) # Give inference view more vertical space
 
         main_split.addWidget(self.views_container, stretch=3)
 
@@ -2147,22 +2675,9 @@ class MainWindow(QtWidgets.QWidget):
         self.pause_btn.setCheckable(True)
         
         self.stop_btn = create_ctrl_btn("⏹", "停止")
-        
-        # 侧向视角切换按钮
-        self.side_left_btn = create_ctrl_btn("◀左侧", "左侧视角")
-        self.side_right_btn = create_ctrl_btn("右侧▶", "右侧视角")
-        self.side_left_btn.setCheckable(True)
-        self.side_right_btn.setCheckable(True)
-        self.side_left_btn.setChecked(True)  # 默认左侧视角
-        
-        # 连接按钮信号（使用延迟连接，避免side_alarm未初始化）
-        self.side_left_btn.clicked.connect(self._on_side_left_clicked)
-        self.side_right_btn.clicked.connect(self._on_side_right_clicked)
-        
+
         btns_row.addWidget(self.pause_btn, stretch=2)
         btns_row.addWidget(self.stop_btn, stretch=1)
-        btns_row.addWidget(self.side_left_btn, stretch=1)
-        btns_row.addWidget(self.side_right_btn, stretch=1)
         controls_layout.addLayout(btns_row)
         
         right_column.addWidget(controls_frame)
@@ -2464,48 +2979,12 @@ class MainWindow(QtWidgets.QWidget):
     def open_camera(self):
         self.start_thread(0)
 
-    def _on_side_left_clicked(self):
-        """左侧视角按钮点击"""
-        self._set_side_view("left")
-    
-    def _on_side_right_clicked(self):
-        """右侧视角按钮点击"""
-        self._set_side_view("right")
-    
-    def _set_side_view(self, side):
-        """设置侧向视角
-        
-        Args:
-            side: "left" 或 "right"
-        """
-        try:
-            if side == "left":
-                self.side_alarm.set_camera_side("left")
-                # 同时更新VideoThread中的side_alarm
-                if self.thread is not None and hasattr(self.thread, 'side_alarm'):
-                    self.thread.side_alarm.set_camera_side("left")
-                self.side_left_btn.setChecked(True)
-                self.side_right_btn.setChecked(False)
-            else:
-                self.side_alarm.set_camera_side("right")
-                # 同时更新VideoThread中的side_alarm
-                if self.thread is not None and hasattr(self.thread, 'side_alarm'):
-                    self.thread.side_alarm.set_camera_side("right")
-                self.side_left_btn.setChecked(False)
-                self.side_right_btn.setChecked(True)
-        except AttributeError:
-            # side_alarm尚未初始化，静默忽略
-            pass
-        except Exception:
-            # 其他错误，静默忽略
-            pass
-    
     def stop_camera(self):
         if self.thread is not None:
             self.thread.stop()
             self.thread = None
         
-        for lbl in [self.label_orig, self.label_pre, self.label_inf, self.label_bev]:
+        for lbl in [self.label_orig, self.label_pre, self.label_inf]:
             lbl.clear()
             lbl.setText("无信号")
             lbl.setStyleSheet("color: #52525b; font-weight: 600; font-family: 'Microsoft YaHei', sans-serif; font-size: 24px; border: none;")
@@ -2568,7 +3047,6 @@ class MainWindow(QtWidgets.QWidget):
     def update_position(self, frame_index, total_frames, current_seconds, total_seconds):
         self.total_frames = total_frames
         self.total_duration = total_seconds
-        self.current_frame_idx = frame_index
         if total_frames > 0:
             self.progress_slider.setEnabled(True)
             self.progress_slider.setRange(0, max(total_frames - 1, 0))
@@ -2586,10 +3064,6 @@ class MainWindow(QtWidgets.QWidget):
             self.pause_btn.setText("▶")
             self.thread.set_paused(True)
         else:
-            # 如果当前已播放到末尾，重新点击播放则从头开始
-            if hasattr(self, 'current_frame_idx') and self.total_frames > 0:
-                if self.current_frame_idx >= self.total_frames - 1:
-                    self.thread.set_frame(0)
             self.pause_btn.setText("⏸")
             self.thread.set_paused(False)
 
@@ -2641,17 +3115,15 @@ class MainWindow(QtWidgets.QWidget):
     def update_side_warning(self, level, message, object_id):
         self.side_warning_timer.start(3000)
         timestamp = time.strftime("%H:%M:%S")
-
+        
         prefix = "⚠️ "
         if level == 'danger': prefix = "🚨 "
-
-        log_msg = f"{prefix} [{timestamp}] {message}"
-        self.log_window.append_log(log_msg)
-        SYSTEM_LOGGER.info(log_msg)
-
+        
+        self.log_window.append_log(f"{prefix} [{timestamp}] {message}")
+        
         self.card_risk.update_value("侧向预警", message)
         self.card_risk.setStyleSheet("""
-            QFrame#statCard { background: #431407; border: 1px solid #d97706; border-radius: 16px; }
+            QFrame#statCard { background: #431407; border: 1px solid #d97706; border-radius: 16px; } 
             QLabel {background: transparent;}
         """)
 
@@ -2662,15 +3134,11 @@ class MainWindow(QtWidgets.QWidget):
 
     def append_log(self, track_id, ttc):
         timestamp = time.strftime("%H:%M:%S")
-        log_msg = f"⚡ [{timestamp}] ID:{track_id} TTC:{ttc:.1f}s"
-        self.log_window.append_log(log_msg)
-        SYSTEM_LOGGER.info(log_msg)
+        self.log_window.append_log(f"⚡ [{timestamp}] ID:{track_id} TTC:{ttc:.1f}s")
 
     def append_system_log(self, message):
         timestamp = time.strftime("%H:%M:%S")
-        log_msg = f"ℹ️ [{timestamp}] {message}"
-        self.log_window.append_log(log_msg)
-        SYSTEM_LOGGER.info(log_msg)
+        self.log_window.append_log(f"ℹ️ [{timestamp}] {message}")
 
     def update_model_name(self, name):
 
@@ -2728,15 +3196,15 @@ class MainWindow(QtWidgets.QWidget):
         self.card_fps.update_value(f"{fps:.1f}", "赫兹")
         self.card_objects.update_value(str(tracked), "个")
 
-    def update_frame(self, img_orig, img_pre, img_inf, img_bev):
-        self.last_images = (img_orig, img_pre, img_inf, img_bev)
+    def update_frame(self, img_orig, img_pre, img_inf):
+        self.last_images = (img_orig, img_pre, img_inf)
         self.render_frames()
 
     def render_frames(self):
         if not hasattr(self, 'last_images') or not self.last_images: return
         
         imgs = self.last_images
-        labels = [self.label_orig, self.label_pre, self.label_inf, self.label_bev]
+        labels = [self.label_orig, self.label_pre, self.label_inf]
         
         for img, lbl in zip(imgs, labels):
             if img.isNull() or lbl.width() <= 0 or lbl.height() <= 0: continue

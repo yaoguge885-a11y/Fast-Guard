@@ -160,4 +160,12 @@ class TTCCalculator:
 
         return min(avg_ttc, self.safe_ttc), vx, vy, dw_dt, red_allowed, vw, is_static, risk_level, in_path
 
-
+    def clean_stale_tracks(self, active_track_ids):
+        """清理已消失的目标数据，防止长视频导致内存泄漏"""
+        stale_ids = [tid for tid in self.width_history.keys() if tid not in active_track_ids]
+        for tid in stale_ids:
+            self.width_history.pop(tid, None)
+            self.width_ema.pop(tid, None)
+            self.ttc_history.pop(tid, None)
+            self.x_history.pop(tid, None)
+            self.y_history.pop(tid, None)

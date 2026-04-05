@@ -635,15 +635,21 @@ class MainWindow(QtWidgets.QWidget):
         self.frame_orig, self.label_orig = create_view_frame("原始画面 // 摄像头 01")
         self.frame_pre, self.label_pre = create_view_frame("预处理 // 图像增强")
         self.frame_inf, self.label_inf = create_view_frame("AI 推理 // 目标检测", "#6366f1")
+        self.frame_bev, self.label_bev = create_view_frame("IPM 俯视图 // BEV", "#10b981") # 绿色强调 BEV
 
-        # Layout: Top Row (Split) + Bottom Row (Full)
+        # Layout: Top Row (Split) + Bottom Row (Split: Inference + BEV)
         row1_layout = QtWidgets.QHBoxLayout()
         row1_layout.setSpacing(16)
         row1_layout.addWidget(self.frame_orig)
         row1_layout.addWidget(self.frame_pre)
 
+        row2_layout = QtWidgets.QHBoxLayout()
+        row2_layout.setSpacing(16)
+        row2_layout.addWidget(self.frame_inf, stretch=7)
+        row2_layout.addWidget(self.frame_bev, stretch=3) # BEV 占比较窄
+
         views_layout.addLayout(row1_layout, stretch=4)
-        views_layout.addWidget(self.frame_inf, stretch=6) # Give inference view more vertical space
+        views_layout.addLayout(row2_layout, stretch=6)
 
         main_split.addWidget(self.views_container, stretch=3)
 
@@ -1076,7 +1082,7 @@ class MainWindow(QtWidgets.QWidget):
             self.thread.stop()
             self.thread = None
         
-        for lbl in [self.label_orig, self.label_pre, self.label_inf]:
+        for lbl in [self.label_orig, self.label_pre, self.label_inf, self.label_bev]:
             lbl.clear()
             lbl.setText("无信号")
             lbl.setStyleSheet("color: #52525b; font-weight: 600; font-family: 'Microsoft YaHei', sans-serif; font-size: 24px; border: none;")
@@ -1299,15 +1305,15 @@ class MainWindow(QtWidgets.QWidget):
         self.card_fps.update_value(f"{fps:.1f}", "赫兹")
         self.card_objects.update_value(str(tracked), "个")
 
-    def update_frame(self, img_orig, img_pre, img_inf):
-        self.last_images = (img_orig, img_pre, img_inf)
+    def update_frame(self, img_orig, img_pre, img_inf, img_bev):
+        self.last_images = (img_orig, img_pre, img_inf, img_bev)
         self.render_frames()
 
     def render_frames(self):
         if not hasattr(self, 'last_images') or not self.last_images: return
         
         imgs = self.last_images
-        labels = [self.label_orig, self.label_pre, self.label_inf]
+        labels = [self.label_orig, self.label_pre, self.label_inf, self.label_bev]
         
         for img, lbl in zip(imgs, labels):
             if img.isNull() or lbl.width() <= 0 or lbl.height() <= 0: continue

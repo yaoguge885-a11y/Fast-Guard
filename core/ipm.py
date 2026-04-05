@@ -16,7 +16,7 @@ class IPM_Transformer:
         cx: Optional[float] = None,
         cy: Optional[float] = None,
         cam_height: float = 1.4,
-        pitch_deg: float = 5.0,
+        pitch_deg: float = 8.0,
         yaw_deg: float = 0.0,
         fov_deg: float = 90.0,
     ):
@@ -84,6 +84,9 @@ class IPM_Transformer:
         t = self.cam_height / -y2
         X = x2 * t
         Y = z2 * t
+        # 距离保护：超出合理范围视为无效
+        if abs(X) > 50.0 or abs(Y) > 50.0:
+            return None
         return X, Y
 
     def ground_to_pixel(self, X: float, Y: float, frame_shape: Tuple[int, int]) -> Optional[Tuple[float, float]]:
