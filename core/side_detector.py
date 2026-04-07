@@ -334,31 +334,38 @@ class SideCollisionDetector:
         track_id: int,
         self_speed: float = 0.0
     ) -> Tuple[float, float]:
-        """
-        计算目标速度
-        
-        Args:
-            track_id: 跟踪 ID
-            self_speed: 本车速度（米/秒）
-        
-        Returns:
-            (vx, vy): 横向速度和纵向速度（米/秒）
-        """
+        """问题5修复：使用最近 4 帧线性回归替代相邻帧差分，抑制 IPM 抖动引入的速度尖峰"""
         x_hist = self._x_history[track_id]
         y_hist = self._y_history[track_id]
-        
+
         if len(x_hist) < 2:
             return 0.0, 0.0
-        
-        # 使用最近两帧计算瞬时速度
-        x_curr, x_prev = x_hist[-1], x_hist[-2]
-        y_curr, y_prev = y_hist[-1], y_hist[-2]
-        
+
         dt = 1.0 / self.fps
-        
-        vx = (x_curr - x_prev) / dt
-        vy = (y_curr - y_prev) / dt
-        
+
+        # 当有 4 帧以上时，用最小二乘法计算速度
+        if len(x_hist) >= 4:
+            n = min(4, len(x_hist))
+            xs = list(x_hist)[-n:]
+            ys_list = list(y_hist)[-n:]
+            ts = [i * dt for i in range(n)]
+            mean_t = sum(ts) / n
+            mean_x = sum(xs) / n
+            mean_y = sum(ys_list) / n
+            denom = sum((t - mean_t) ** 2 for t in ts)
+            if denom > 1e-9:
+                vx = sum((t - mean_t) * (x - mean_x) for t, x in zip(ts, xs)) / denom
+                vy = sum((t - mean_t) * (y - mean_y) for t, y in zip(ts, ys_list)) / denom
+            else:
+                vx = (xs[-1] - xs[-2]) / dt
+                vy = (ys_list[-1] - ys_list[-2]) / dt
+        else:
+            # 少于 4 帧时用相邻帧差分
+            x_curr, x_prev = x_hist[-1], x_hist[-2]
+            y_curr, y_prev = y_hist[-1], y_hist[-2]
+            vx = (x_curr - x_prev) / dt
+            vy = (y_curr - y_prev) / dt
+
         return vx, vy
     
     def _is_in_monitor_zone(self, x: float, y: float, distance_x: float = None) -> bool:
@@ -497,49 +504,36 @@ class SideCollisionDetector:
         vy: float = 0.0
     ) -> int:
         """
-        计算风险等级（X轴三级报警体系）
-
-        Args:
-            distance_x: 横向距离（米），已考虑 body_offset，X=0 为车身边缘
-            ttl: 侧向侵入时间（秒），TTL = distance_x / |vx|
-            is_approaching: 是否正在靠近（X轴方向）
-            approach_speed: 横向靠近速度（米/秒）
-            is_static: 是否静止
-            is_in_bsd: 是否在盲区范围内（已考虑 body_offset）
-            vy: 纵向速度（米/秒），正值表示目标在向前移动，负值表示向后移动（掉队）
-
-        Returns:
-            风险等级（0=安全, 1=注意, 2=危险）
+        问题4与问题7修复：基于距离×靠近速度组合判定，并过滤超车场景误报
         """
-        cfg = self.config
-
-        # ========== 第一级：红色强制报警（X < 1.0m）==========
-        # 突破 0.8m 壁垒 + 0.2m 缓冲，立即报警
-        if distance_x < 1.0:
-            if vy < -0.5:
-                # 目标正在明显向后掉队（例如我方正在超越），降级为黄警
-                return 1
-            return 2
-
-        # ========== 第二级：黄色预警（1.0m ≤ X < 3.0m）==========
-        if distance_x < 3.0:
-            # 目标正在向后掉队，降低预警
-            if vy < 0:
-                return 0
-            return 1
-
-        # ========== 第三级：安全区域（X ≥ 3.0m）==========
-        if vy < 0:
-            return 0
-
-        # 静态目标过滤
+        # 静止目标全面过滤
         if is_static:
             return 0
 
-        # TTL危险判定：只有当TTL < 1.0s且is_approaching才触发红色报警
-        if is_approaching and ttl < cfg.ttl_danger_threshold:  # 1.0s
+        # ========== 极近区（X < 0.8m）：无条件红警，已物理越线 ==========
+        if distance_x < 0.8:
             return 2
 
+        # ========== 近区（0.8m ≤ X < 2.0m）：需要有明确的靠近趋势才报警 ==========
+        if distance_x < 2.0:
+            # 问题7：超车场景过滤 — 目标在快速向后掉队（我方超过其前）
+            if vy < -1.0 and not is_approaching:
+                return 0
+            # 有明确的横向靠近趋势才控车
+            if is_approaching and approach_speed > 0.3:
+                return 2 if ttl < 1.5 else 1
+            # 在极近区但未明显靠近，保守性黄色预警
+            return 1
+
+        # ========== 中区（2.0m ≤ X < 4.0m）：有靠近趋势才黄警 ==========
+        if distance_x < 4.0:
+            if vy < -1.0 and not is_approaching:
+                return 0
+            if is_approaching and approach_speed > 0.5:
+                return 1
+            return 0
+
+        # ========== 安全区（X ≥ 4.0m）==========
         return 0
     
     def _generate_warning(
