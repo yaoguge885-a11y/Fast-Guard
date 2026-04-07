@@ -166,7 +166,7 @@ class FrontCollisionDetector:
                 if ttc_by_dist > 0:
                     ttc = min(ttc, ttc_by_dist)
         
-        # 计算速度
+        # 计算速度（提前到静止判断之前，为 vy 门控提供数据）
         vx = 0.0
         vy = 0.0
         vw = 0.0
@@ -174,7 +174,12 @@ class FrontCollisionDetector:
             vx = (xs[-1] - xs[-2]) * self.fps - float(global_vx)
             vy = (ys[-1] - ys[-2]) * self.fps - float(global_vy)
             vw = (widths[-1] - widths[-2]) * self.fps
-        
+
+        # 问题3修复：纵向方向门控 — 横穿目标（vy向下）误到 TTC 报警，取消其 TTC
+        if vy > 3.0 and ttc < self.safe_ttc:
+            ttc = self.safe_ttc
+            dw_dt = 0.0
+
         # 判断是否静止 - 提高阈值减少误判
         is_static = False
         if len(xs) >= 10:
@@ -184,7 +189,6 @@ class FrontCollisionDetector:
             dx_range = max(recent_x) - min(recent_x)
             dy_range = max(recent_y) - min(recent_y)
             dw_range = max(recent_w) - min(recent_w)
-            # 提高静止判断阈值 2.0 -> 5.0 像素
             if dx_range <= 5.0 and dy_range <= 5.0 and abs(dw_range) <= 5.0:
                 is_static = True
         
@@ -202,8 +206,10 @@ class FrontCollisionDetector:
         
         # 动态 SDT 计算
         sdt_dyn = (max(0.0, v_self_mps) + max(0.0, -vy)) * t_reaction + d_safe
-        # 提高TTC阈值 2.0 -> 2.5秒
-        ttc_threshold = 2.5
+        
+        # 问题2修复：动态 TTC 阈值，透过车速高低实现自适应
+        # 高车速时反应时间需求更大，首先接收闭區的目标
+        ttc_threshold = min(3.0, max(1.8, 1.5 + float(v_self_mps) * 0.05))
         
         # 视觉冲突过滤（背景流）
         bg_flow = False
