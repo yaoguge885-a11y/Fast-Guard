@@ -198,12 +198,6 @@ class VideoThread(QtCore.QThread):
         self.side_alarm = SideAlarm(camera_side="left")
         self.audio_alarm = CollisionAlarm(frequency=2500, duration=80, interval=0.08)
         
-        # 实时决策日志
-        from core.reasoning_logger import ReasoningLogger
-        self.reasoning_logger = ReasoningLogger()
-        # 添加测试日志
-        self.reasoning_logger.add_log("系统启动")
-        
         # IPM & 轨迹评估
         self.ipm = IPM_Transformer()  # 前向 IPM
         self.side_ipm = get_side_ipm("left")  # 侧面 IPM（支持左右切换）
@@ -225,7 +219,8 @@ class VideoThread(QtCore.QThread):
         self.stereo_mode = False  # 默认为单目，SBS宽屏自动切换
         self.stereo_matcher = None
         self.baseline = 0.12  # 默认基线 12cm (需根据实际硬件调整)
-        self.focal_length = 800  # 默认焦距 (像素单位，需标定)
+        self.focal_length = 800  # 初始默认值，首帧读取后自动按分辨率校准
+        self._focal_calibrated = False  # 是否已校准焦距
         self.disparity_map = None
 
         self._user_paused = False
@@ -371,88 +366,6 @@ class VideoThread(QtCore.QThread):
             draw_obj.text(org, text, font=font, fill=color[::-1]) # BGR -> RGB
             
         return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-    
-    def _draw_reasoning_log(self, frame):
-        """
-        在画面右侧绘制实时决策日志
-        
-        绘制位置：画面右侧 300px 区域
-        视觉效果：黑色半透明背景 + 逐行文字渲染
-        """
-        h, w = frame.shape[:2]
-        
-        # 定义日志区域
-        log_width = 300
-        log_x = w - log_width
-        log_y = 0
-        
-        # 获取日志数据
-        logs = self.reasoning_logger.get_logs()
-        
-        # 设置最大行数和行高
-        max_lines = 15
-        line_height = 16
-        
-        # 绘制黑色半透明背景矩形 (Alpha=120) - 只覆盖实际文字区域
-        overlay = frame.copy()
-        
-        # 计算需要显示的行数
-        num_lines = min(len(logs), max_lines)
-        if num_lines > 0:
-            # 计算背景高度（包含边距）
-            bg_height = num_lines * line_height + 20
-            bg_y1 = h - bg_height - 10
-            bg_y2 = h - 10
-            
-            # 只绘制覆盖文字区域的矩形
-            cv2.rectangle(overlay, (log_x, bg_y1), (w, bg_y2), (0, 0, 0), -1)
-            alpha = 120 / 255.0  # 透明度
-            cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-        
-        # 使用 PIL 绘制中文字符
-        from PIL import Image, ImageDraw, ImageFont
-        import numpy as np
-        
-        # OpenCV -> PIL
-        img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        draw_obj = ImageDraw.Draw(img_pil)
-        
-        # 字体设置
-        font_size = 12
-        text_color = (255, 255, 255)  # 白色
-        shadow_color = (0, 0, 0)      # 黑色阴影
-        
-        # 计算起始位置（从底部开始）
-        start_y = h - 20
-        
-        # 绘制文字（新日志显示在底部）
-        for i, log in enumerate(reversed(logs)):
-            if i >= max_lines:
-                break
-                
-            y = start_y - i * line_height
-            if y < 20:
-                break
-                
-            try:
-                # 尽量复用字体对象
-                if self.cached_font and self.cached_font.size == font_size:
-                    font = self.cached_font
-                else:
-                    font = ImageFont.truetype(self.font_path, font_size)
-                
-                # 绘制阴影
-                draw_obj.text((log_x + 9, y + 1), log, font=font, fill=shadow_color)
-                # 绘制文字
-                draw_obj.text((log_x + 8, y), log, font=font, fill=text_color)
-            except Exception:
-                # 字体加载失败时使用默认字体
-                font = ImageFont.load_default()
-                draw_obj.text((log_x + 9, y + 1), log, font=font, fill=shadow_color)
-                draw_obj.text((log_x + 8, y), log, font=font, fill=text_color)
-        
-        # PIL -> OpenCV
-        frame[:] = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
 
 
@@ -610,7 +523,7 @@ class VideoThread(QtCore.QThread):
 
         # 初始化碰撞检测器
         self.front_detector = FrontCollisionDetector(self.fps)
-        self.side_detector = SideCollisionDetector(self.fps, logger=self.reasoning_logger)
+        self.side_detector = SideCollisionDetector(self.fps)
 
         if not os.path.exists(self.model_path):
             model_filename = os.path.basename(self.model_path)
@@ -679,6 +592,12 @@ class VideoThread(QtCore.QThread):
                 continue
 
             h, w = frame.shape[:2]
+            # 问题1修复：首帧自动按分辨率推算焦距（1080p 65°水平FOV → fx≈1507）
+            if not self._focal_calibrated and w > 0:
+                import math as _math
+                fov_deg = 65.0  # 典型行车记录仪水平视角
+                self.focal_length = (w / 2.0) / _math.tan(_math.radians(fov_deg) / 2.0)
+                self._focal_calibrated = True
             # 初始化 IPM 内参（如果未设置）
             if self.ipm:
                 self.ipm.set_frame(w, h)
@@ -996,6 +915,14 @@ class VideoThread(QtCore.QThread):
                 self.current_ipm = self.ipm
             
             for track_id, x1, y1, x2, y2, cx, cy, class_name in infos:
+                # 问题8修复：每次循环开始统一初始化所有输出变量，防止 IPM 失败时访问脏值
+                ttc = 99.0
+                vx = vy = dw_dt = vw = 0.0
+                risk_level = 0
+                in_path = False
+                red_allowed = False
+                is_static = False
+
                 # 侧面视角不需要检测线过滤
                 width = max(1, x2 - x1)
                 height = max(1, y2 - y1)
@@ -1054,18 +981,17 @@ class VideoThread(QtCore.QThread):
                     # 计算检测框中心点x坐标
                     bbox_cx = (x1 + x2) // 2
                     
-                    # 判断检测框中心是否靠近图像中心水平线（距离中心不超过40%图像宽度）
-                    near_center_x = abs(bbox_cx - w // 2) < (w * 0.40)
-                    # 判断检测框是否足够大（宽度超过图像宽度的30%或高度超过图像高度的40%）
-                    large_bbox = (bbox_width > w * 0.30) or (bbox_height > h * 0.40)
+                    # 问题6修复：收紧 immediate_alarm 判定条件，防止正常路边大车误触发
+                    # 中心区域：±25%（原±40%）
+                    near_center_x = abs(bbox_cx - w // 2) < (w * 0.25)
+                    # 大目标：宽度 AND 高度都超过阈值（原为 OR）
+                    large_bbox = (bbox_width > w * 0.50) and (bbox_height > h * 0.50)
                     # 判断检测框是否靠近车身一侧（根据相机侧）
                     if self.side_ipm and self.side_ipm.camera_side == "left":
-                        # 左相机：车身在右侧，检测框右侧应靠近图像右边缘
-                        near_vehicle_side = x2 > w * 0.6
+                        near_vehicle_side = x2 > w * 0.65
                     else:
-                        # 右相机：车身在左侧，检测框左侧应靠近图像左边缘
-                        near_vehicle_side = x1 < w * 0.4
-                    
+                        near_vehicle_side = x1 < w * 0.35
+
                     immediate_alarm = near_center_x and large_bbox and near_vehicle_side
                     
                     if self.side_ipm and not immediate_alarm:
@@ -1289,38 +1215,9 @@ class VideoThread(QtCore.QThread):
                 if world_pos is not None:
                     bev_data.append((world_pos, class_name, risk_level))
 
-            # 优化报警触发条件 - 提高阈值并增加确认机制
-            alarm_triggered = False
-            
-            if self.current_perspective == "前向视角":
-                # 前向视角：TTC < 1.2秒且风险等级为2才报警
-                if min_ttc < 1.2 and min_id >= 0:
-                    # 检查该目标的风险等级
-                    for track_id, x1, y1, x2, y2, cx, cy, class_name in infos:
-                        if track_id == min_id:
-                            # 重新获取该目标的检测参数
-                            width = max(1, x2 - x1)
-                            height = max(1, y2 - y1)
-                            area_ratio = (width * height) / max(1, w * h)
-                            
-                            # 调用检测器获取风险等级
-                            _, _, _, _, _, _, _, risk_level, _ = self.front_detector.update(
-                                track_id, width, cx, cy, y2, w, h, warning_line_y,
-                                area_ratio, global_vx, global_vy,
-                                distance=obj_dist if 'obj_dist' in locals() else None,
-                                v_self_mps=self.v_self_mps,
-                                t_reaction=self.t_reaction,
-                                d_safe=self.d_safe,
-                            )
-                            if risk_level >= 2:
-                                alarm_triggered = True
-                            break
-            else:
-                # 侧面视角：基于最近距离和壁垒突破
-                if closest_side_dist < 0.8:  # 突破0.8米壁垒
-                    alarm_triggered = True
-            
-            if alarm_triggered:
+            # 问题9修复：前向/侧向使用独立的 TTC 报警阈值
+            alarm_threshold = 2.0 if self.current_perspective == "侧面视角" else 2.5
+            if min_ttc < alarm_threshold:
                 if self._frame_count % 2 == 0:
                     cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 8)
                 self.log_signal.emit(min_id, min_ttc)
@@ -1347,9 +1244,6 @@ class VideoThread(QtCore.QThread):
             if deferred_draws:
                 frame = self._draw_batch_chinese(frame, deferred_draws)
                 deferred_draws = []
-            
-            # 绘制实时决策日志
-            self._draw_reasoning_log(frame)
 
             # 1. Original View
             rgb_orig = cv2.cvtColor(frame_raw, cv2.COLOR_BGR2RGB)
