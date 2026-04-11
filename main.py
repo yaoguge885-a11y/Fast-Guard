@@ -8,11 +8,14 @@ import math
 import shutil
 import logging
 
-# 设置全局系统日志记录器
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
-os.makedirs(LOG_DIR, exist_ok=True)
+# 设置全局系统日志记录器（按启动时间分会话目录）
+
+LOG_ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+os.makedirs(LOG_ROOT_DIR, exist_ok=True)
 LOG_TIMESTAMP = time.strftime('%Y%m%d_%H%M%S')
-LOG_FILE = os.path.join(LOG_DIR, f'system_log_{LOG_TIMESTAMP}.log')
+LOG_SESSION_DIR = os.path.join(LOG_ROOT_DIR, LOG_TIMESTAMP)
+os.makedirs(LOG_SESSION_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_SESSION_DIR, 'system_log.log')
 
 SYSTEM_LOGGER = logging.getLogger(f'System_{LOG_TIMESTAMP}')
 SYSTEM_LOGGER.setLevel(logging.DEBUG)
@@ -22,7 +25,8 @@ fh.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S')
 fh.setFormatter(formatter)
 SYSTEM_LOGGER.addHandler(fh)
-SYSTEM_LOGGER.info(f"系统启动，日志文件：{LOG_FILE}")
+SYSTEM_LOGGER.info(f"系统启动，日志目录：{LOG_SESSION_DIR}")
+
 
 import ultralytics
 import cv2
@@ -37,7 +41,13 @@ from core.side_alarm import SideAlarm
 from core.front_alarm import FrontAlarm
 from core.alarm import CollisionAlarm
 
+from auth.db import UserDB, LogDB
+from auth.ui import LoginDialog
+from auth.admin import AdminPanel
+
+
 import torch
+
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont   # 新增：PIL 中文支持
@@ -186,7 +196,8 @@ class VideoThread(QtCore.QThread):
         self._frame_count = 0
         self._last_centers = {}
         self._seen_counts = {}
-        self.view_classifier = ViewClassifier()
+        self.view_classifier = ViewClassifier(log_dir=LOG_SESSION_DIR)
+
         self.current_perspective = "分析中..."
         self.perspective_locked = False
         self.last_perspective_time = 0
@@ -1350,9 +1361,9 @@ class SplashScreen(QtWidgets.QWidget):
         self.bg_frame.setObjectName("splashBg")
         self.bg_frame.setStyleSheet("""
             QFrame#splashBg {
-                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #1a1a2e, stop:0.5 #16213e, stop:1 #0f3460);
+                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #09090b, stop:0.5 #18181b, stop:1 #27272a);
                 border-radius: 24px;
-                border: 2px solid #4e4e91;
+                border: 2px solid #3f3f46;
             }
         """)
         bg_layout = QtWidgets.QVBoxLayout(self.bg_frame)
@@ -1361,8 +1372,8 @@ class SplashScreen(QtWidgets.QWidget):
 
         # Icon / Logo Placeholder (Modern style)
         logo_layout = QtWidgets.QHBoxLayout()
-        logo_label = QtWidgets.QLabel("🛡️")
-        logo_label.setStyleSheet("font-size: 80px; background: transparent;")
+        logo_label = QtWidgets.QLabel("❖")
+        logo_label.setStyleSheet("font-size: 80px; background: transparent; color: #6366f1;")
         logo_layout.addStretch()
         logo_layout.addWidget(logo_label)
         logo_layout.addStretch()
@@ -1381,7 +1392,7 @@ class SplashScreen(QtWidgets.QWidget):
         
         self.subtitle_label = QtWidgets.QLabel("智能防碰撞预警引擎")
         self.subtitle_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.subtitle_label.setStyleSheet("color: #a29bfe; font-size: 24px; letter-spacing: 8px; font-weight: 700; background: transparent; margin-top: 10px;")
+        self.subtitle_label.setStyleSheet("color: #6366f1; font-size: 24px; letter-spacing: 8px; font-weight: 700; background: transparent; margin-top: 10px;")
 
         # Progress Section
         progress_container = QtWidgets.QWidget()
@@ -1395,18 +1406,18 @@ class SplashScreen(QtWidgets.QWidget):
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setStyleSheet("""
             QProgressBar {
-                background: rgba(255, 255, 255, 10);
-                border: none;
+                background: #18181b;
+                border: 1px solid #27272a;
                 border-radius: 6px;
             }
             QProgressBar::chunk {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #a29bfe, stop:1 #6c5ce7);
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #4f46e5, stop:1 #6366f1);
                 border-radius: 6px;
             }
         """)
 
         self.status_label = QtWidgets.QLabel("正在初始化系统组件...")
-        self.status_label.setStyleSheet("color: #b2bec3; font-family: 'Consolas', 'Microsoft YaHei', monospace; font-size: 16px; background: transparent;")
+        self.status_label.setStyleSheet("color: #a1a1aa; font-family: 'Consolas', 'Microsoft YaHei', monospace; font-size: 16px; background: transparent;")
         self.status_label.setAlignment(QtCore.Qt.AlignCenter)
 
         progress_layout.addWidget(self.progress_bar)
@@ -1463,6 +1474,8 @@ class SplashScreen(QtWidgets.QWidget):
         self.finished.emit()
 
 class StatCard(QtWidgets.QFrame):
+
+
     def __init__(self, title, value, unit, icon_text="📊", color="#6366f1", parent=None):
         super().__init__(parent)
         self.setObjectName("statCard")
@@ -1526,17 +1539,21 @@ class StatCard(QtWidgets.QFrame):
 
 
 class LogWindow(QtWidgets.QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, log_db: LogDB, username: str, is_admin: bool = False, parent=None):
         super().__init__(parent)
+        self.log_db = log_db
+        self.username = username
+        self.is_admin = is_admin
         self.setWindowTitle("系统日志")
-        self.resize(600, 700) # Larger window
+        self.resize(700, 720)
         self.setStyleSheet("""
             QDialog { background-color: #09090b; }
             QLabel { color: white; font-size: 18px; font-weight: bold; font-family: 'Microsoft YaHei'; }
         """)
         
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(QtWidgets.QLabel("📋 系统事件记录"))
+        header = "📋 系统事件记录" if self.is_admin else "📋 我的日志"
+        layout.addWidget(QtWidgets.QLabel(header))
         
         self.log_list = QtWidgets.QListWidget()
         self.log_list.setStyleSheet("""
@@ -1546,28 +1563,56 @@ class LogWindow(QtWidgets.QDialog):
                 border-radius: 8px;
                 color: #a1a1aa;
                 font-family: 'Consolas', 'Microsoft YaHei Mono', monospace;
-                font-size: 14px; /* Larger log font */
+                font-size: 14px;
                 outline: none;
             }
             QListWidget::item { padding: 6px; }
             QListWidget::item:selected { background: #27272a; color: white; }
         """)
         layout.addWidget(self.log_list)
-        
-        btn_clear = QtWidgets.QPushButton("清空记录")
-        btn_clear.clicked.connect(self.log_list.clear)
-        btn_clear.setStyleSheet("""
-            QPushButton {
-                background: #27272a; color: white; border: 1px solid #3f3f46;
-                border-radius: 6px; padding: 10px 16px; font-size: 16px; font-family: 'Microsoft YaHei';
-            }
-            QPushButton:hover { background: #3f3f46; }
-        """)
-        layout.addWidget(btn_clear)
 
-    def append_log(self, text):
+        btn_row = QtWidgets.QHBoxLayout()
+        self.btn_refresh = QtWidgets.QPushButton("刷新")
+        self.btn_clear = QtWidgets.QPushButton("清空我的日志" if not self.is_admin else "清空全部日志")
+        self.btn_refresh.clicked.connect(self.reload)
+        self.btn_clear.clicked.connect(self.clear_logs)
+        btn_row.addWidget(self.btn_refresh)
+        btn_row.addWidget(self.btn_clear)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.reload()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.reload()
+
+    def add_log_entry(self, text):
         self.log_list.addItem(text)
         self.log_list.scrollToBottom()
+
+    def reload(self):
+        self.log_list.clear()
+        rows = self.log_db.list_logs(None if self.is_admin else self.username, limit=300)
+        for _, username, level, message, created_at, category in rows[::-1]:
+            prefix = "ℹ️"
+            if level == "danger":
+                prefix = "🚨"
+            elif level == "warning":
+                prefix = "⚠️"
+            elif level == "event":
+                prefix = "⚡"
+            text = f"{prefix} [{created_at}] {username} | {category} | {message}"
+            self.log_list.addItem(text)
+        self.log_list.scrollToBottom()
+
+    def clear_logs(self):
+        if self.is_admin:
+            self.log_db.clear_logs()
+        else:
+            self.log_db.clear_logs(self.username)
+        self.reload()
+
 
 
 class SettingsWindow(QtWidgets.QDialog):
@@ -1637,8 +1682,13 @@ class SettingsWindow(QtWidgets.QDialog):
 
     # --- 主窗口核心逻辑 ---
 class MainWindow(QtWidgets.QWidget):
-    def __init__(self):
+    def __init__(self, user_db: UserDB, log_db: LogDB, username: str, role: str):
         super().__init__()
+        self.user_db = user_db
+        self.log_db = log_db
+        self.current_user = username
+        self.current_role = role
+
         self.setWindowTitle("FastGuard 智能监控系统")
         self.resize(1400, 850)
         self.setWindowState(QtCore.Qt.WindowMaximized)
@@ -1664,7 +1714,9 @@ class MainWindow(QtWidgets.QWidget):
         self.edge_strength_threshold = self.default_edge_strength_threshold
         self.total_duration = 0.0
         self.total_frames = 0
-        self.log_window = LogWindow(self)
+        self.log_window = LogWindow(self.log_db, self.current_user, self.current_role == "admin", self)
+        self.admin_panel = AdminPanel(self.user_db, self.log_db, self) if self.current_role == "admin" else None
+
         self.settings_window = SettingsWindow(self.weak_conf_threshold, self.edge_strength_threshold, self)
         self.settings_window.preprocess_changed.connect(self.update_preprocess_from_dialog)
         
@@ -1712,7 +1764,12 @@ class MainWindow(QtWidgets.QWidget):
         app_logo_layout.addStretch()
         
         sidebar_layout.addLayout(app_logo_layout)
-        sidebar_layout.addSpacing(50)
+
+        self.user_label = QtWidgets.QLabel(f"当前用户：{self.current_user}")
+        self.user_label.setStyleSheet("color: #a1a1aa; font-size: 14px; font-weight: 600; font-family: 'Microsoft YaHei';")
+        sidebar_layout.addWidget(self.user_label)
+        sidebar_layout.addSpacing(30)
+
 
         # Menu Group: MAIN
         lbl_main = QtWidgets.QLabel("主菜单")
@@ -1744,8 +1801,13 @@ class MainWindow(QtWidgets.QWidget):
         
         self.btn_log = create_nav_btn("📟", "系统日志", "查看运行日志")
         self.btn_settings = create_nav_btn("⚙", "参数设置", "调整检测参数")
+        if self.current_role == "admin":
+            self.btn_admin = create_nav_btn("🛡", "后台管理", "管理用户与日志")
+        else:
+            self.btn_admin = None
         
         sidebar_layout.addStretch()
+
         
         # Menu Group: SYSTEM
         lbl_system = QtWidgets.QLabel("系统")
@@ -2079,6 +2141,9 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_exit.clicked.connect(self.close)
         self.btn_log.clicked.connect(self.log_window.show)
         self.btn_settings.clicked.connect(self.settings_window.show)
+        if self.btn_admin:
+            self.btn_admin.clicked.connect(self.admin_panel.show)
+
         self.btn_help.clicked.connect(self.show_help_dialog)
 
         self.pause_btn.toggled.connect(self.toggle_pause)
@@ -2540,8 +2605,9 @@ class MainWindow(QtWidgets.QWidget):
         if level == 'danger': prefix = "🚨 "
 
         log_msg = f"{prefix} [{timestamp}] {message}"
-        self.log_window.append_log(log_msg)
-        SYSTEM_LOGGER.info(log_msg)
+        self.log_db.add_log(self.current_user, "warning" if level == 'warning' else "danger", message, "side")
+        self.log_window.add_log_entry(log_msg)
+
 
         self.card_risk.update_value("侧向预警", message)
         self.card_risk.setStyleSheet("""
@@ -2557,14 +2623,16 @@ class MainWindow(QtWidgets.QWidget):
     def append_log(self, track_id, ttc):
         timestamp = time.strftime("%H:%M:%S")
         log_msg = f"⚡ [{timestamp}] ID:{track_id} TTC:{ttc:.1f}s"
-        self.log_window.append_log(log_msg)
-        SYSTEM_LOGGER.info(log_msg)
+        self.log_db.add_log(self.current_user, "event", f"ID:{track_id} TTC:{ttc:.1f}s", "front")
+        self.log_window.add_log_entry(log_msg)
+
 
     def append_system_log(self, message):
         timestamp = time.strftime("%H:%M:%S")
         log_msg = f"ℹ️ [{timestamp}] {message}"
-        self.log_window.append_log(log_msg)
-        SYSTEM_LOGGER.info(log_msg)
+        self.log_db.add_log(self.current_user, "info", message, "system")
+        self.log_window.add_log_entry(log_msg)
+
 
     def update_model_name(self, name):
 
@@ -2656,14 +2724,26 @@ def main():
     print_versions()
     app = QtWidgets.QApplication(sys.argv)
     
+    user_db = UserDB()
+    log_db = LogDB(user_db.db_path)
     splash = SplashScreen()
-    window = MainWindow()
-    
-    # When splash finishes, show main window
-    splash.finished.connect(window.show)
+    window_holder = {"window": None}
+
+    def on_splash_finished():
+        login = LoginDialog(user_db)
+        if login.exec_() == QtWidgets.QDialog.Accepted:
+            window_holder["window"] = MainWindow(user_db, log_db, login.username, login.role)
+            window_holder["window"].show()
+        else:
+            app.quit()
+
+    # When splash finishes, show login dialog then main window
+    splash.finished.connect(on_splash_finished)
     splash.show()
     
     sys.exit(app.exec_())
+
+
 
 
 # ==================================================================================

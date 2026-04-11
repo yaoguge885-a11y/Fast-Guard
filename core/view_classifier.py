@@ -19,15 +19,20 @@ import collections
 class ViewClassifier:
     """视角分类器：具备连续反馈和多维时延感知的判决状态机"""
 
-    def __init__(self):
+    def __init__(self, log_dir: str = None):
+        self.log_dir = log_dir
         self.reset()
         self.setup_logger()
 
     def setup_logger(self):
-        log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
+        if self.log_dir:
+            log_dir = self.log_dir
+        else:
+            log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'logs')
         os.makedirs(log_dir, exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         log_file = os.path.join(log_dir, f'view_classifier_{timestamp}.log')
+
 
         self.logger = logging.getLogger(f'ViewClassifier_{timestamp}')
         self.logger.setLevel(logging.DEBUG)
