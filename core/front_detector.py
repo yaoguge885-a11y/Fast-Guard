@@ -6,6 +6,7 @@
 """
 
 from collections import deque
+import math
 from typing import Tuple, Optional, Dict
 
 
@@ -19,22 +20,13 @@ class FrontCollisionDetector:
         self.fps = fps if fps and fps > 0 else 30.0
         self.safe_ttc = 99.0
         self.width_history_len = 10
-        self.ttc_history_len = 5
         
         # 历史数据存储
         self.width_history = {}
         self.width_ema = {}
-        self.ttc_history = {}
         self.x_history = {}
         self.y_history = {}
-        
-        # 新增：连续报警确认计数器
-        self.alert_frames = {}
-        self.min_alert_frames = 3  # 至少3帧才报警
-        
-        # 新增：历史风险等级记录
-        self.risk_history = {}
-        self.risk_history_len = 5
+        self.ground_dist_history = {}
     
     def update(
         self,
@@ -56,6 +48,7 @@ class FrontCollisionDetector:
         v_self_mps: float = 0.0,
         t_reaction: float = 1.2,
         d_safe: float = 2.0,
+        ipm: Optional[object] = None,
     ) -> Tuple[float, float, float, float, bool, float, bool, int, bool]:
         """
         更新目标状态并计算正面碰撞风险
@@ -79,6 +72,7 @@ class FrontCollisionDetector:
             v_self_mps: 本车速度（米/秒）
             t_reaction: 反应时间（秒）
             d_safe: 最小安全距离（米）
+            ipm: IPM_Transformer 实例（可选）
         
         Returns:
             (ttc, vx, vy, dw_dt, red_allowed, vw, is_static, risk_level, in_path)
@@ -86,18 +80,14 @@ class FrontCollisionDetector:
         # 初始化历史数据
         if track_id not in self.width_history:
             self.width_history[track_id] = deque(maxlen=self.width_history_len)
-        if track_id not in self.ttc_history:
-            self.ttc_history[track_id] = deque(maxlen=self.ttc_history_len)
         if track_id not in self.x_history:
             self.x_history[track_id] = deque(maxlen=self.width_history_len)
         if track_id not in self.y_history:
             self.y_history[track_id] = deque(maxlen=self.width_history_len)
         if track_id not in self.width_ema:
             self.width_ema[track_id] = float(width)
-        if track_id not in self.alert_frames:
-            self.alert_frames[track_id] = 0
-        if track_id not in self.risk_history:
-            self.risk_history[track_id] = deque(maxlen=self.risk_history_len)
+        if track_id not in self.ground_dist_history:
+            self.ground_dist_history[track_id] = deque(maxlen=2)
         
         widths = self.width_history[track_id]
         xs = self.x_history[track_id]
@@ -117,6 +107,16 @@ class FrontCollisionDetector:
         widths.append(width_for_calc)
         xs.append(float(center_x))
         ys.append(float(center_y))
+        
+        # IPM 物理距离估计（模型B）
+        ground_distance = None
+        if ipm is not None:
+            world_pos = ipm.pixel_to_ground(center_x, bottom_y, (frame_h, frame_w))
+            if world_pos is not None:
+                gx, gy = world_pos
+                if gy > 0:
+                    ground_distance = math.hypot(gx, gy)
+                    self.ground_dist_history[track_id].append(ground_distance)
         
         # 面积阈值判断 - 提高阈值减少小目标误报
         area_ok = area_ratio >= float(min_area_ratio)
@@ -166,6 +166,19 @@ class FrontCollisionDetector:
                 if ttc_by_dist > 0:
                     ttc = min(ttc, ttc_by_dist)
         
+        # 模型B TTC：IPM 物理距离差分
+        ttc_b = self.safe_ttc
+        dist_hist = self.ground_dist_history[track_id]
+        if ground_distance is not None and len(dist_hist) >= 2:
+            d_prev = dist_hist[-2]
+            d_cur = dist_hist[-1]
+            v_rel = (d_prev - d_cur) * self.fps  # m/s，正值表示接近
+            if v_rel > 1e-3 and d_cur > 1e-3:
+                ttc_b = d_cur / v_rel
+        
+        # 双模型 TTC 取更小值，防止单模型失效
+        ttc = min(ttc, ttc_b)
+        
         # 计算速度（提前到静止判断之前，为 vy 门控提供数据）
         vx = 0.0
         vy = 0.0
@@ -192,10 +205,8 @@ class FrontCollisionDetector:
             if dx_range <= 5.0 and dy_range <= 5.0 and abs(dw_range) <= 5.0:
                 is_static = True
         
-        # TTC 历史平滑
-        ttc_hist = self.ttc_history[track_id]
-        ttc_hist.append(min(float(ttc), self.safe_ttc))
-        avg_ttc = sum(ttc_hist) / len(ttc_hist)
+        # TTC 直接使用（已通过宽度EMA与双模型取最小值抑制抖动）
+        ttc_effective = min(float(ttc), self.safe_ttc)
         
         # 风险分级（0 安全 / 1 注意 / 2 危险）
         risk_level = 0
@@ -204,12 +215,13 @@ class FrontCollisionDetector:
         if provided_distance is not None and len(xs) >= 2:
             v_rel_eff = ((ys[-1] - ys[-2]) * self.fps - float(global_vy)) - v_self_mps
         
+        phys_distance = ground_distance if ground_distance is not None else provided_distance
+        
         # 动态 SDT 计算
         sdt_dyn = (max(0.0, v_self_mps) + max(0.0, -vy)) * t_reaction + d_safe
         
-        # 问题2修复：动态 TTC 阈值，透过车速高低实现自适应
-        # 高车速时反应时间需求更大，首先接收闭區的目标
-        ttc_threshold = min(3.0, max(1.8, 1.5 + float(v_self_mps) * 0.05))
+        # 更灵敏的 TTC 阈值（废除连续帧强制限制）
+        ttc_threshold = min(3.5, max(2.2, 1.8 + float(v_self_mps) * 0.06))
         
         # 视觉冲突过滤（背景流）
         bg_flow = False
@@ -220,11 +232,11 @@ class FrontCollisionDetector:
         
         # 基于 SDT + TTC 的风险判定
         if in_path and red_allowed and not bg_flow:
-            close_enough = provided_distance is not None and provided_distance < sdt_dyn
+            close_enough = phys_distance is not None and phys_distance < sdt_dyn
             # 增加TTC上限限制，避免极远目标误报
-            if close_enough and avg_ttc < ttc_threshold and avg_ttc > 0.1:
+            if close_enough and ttc_effective < ttc_threshold and ttc_effective > 0.1:
                 risk_level = 2
-            elif avg_ttc < ttc_threshold and avg_ttc > 0.1:
+            elif ttc_effective < ttc_threshold and ttc_effective > 0.1:
                 risk_level = 1
         
         # 横移且偏离中心线时强制降级，避免路侧快速横移误报
@@ -237,47 +249,26 @@ class FrontCollisionDetector:
         if is_static:
             risk_level = 0
         
-        # 记录风险历史
-        self.risk_history[track_id].append(risk_level)
+        # 物理距离近场硬触发：D < 3m 直接危险
+        if phys_distance is not None and phys_distance < 3.0:
+            risk_level = 2
         
-        # 连续帧确认机制 - 减少瞬时抖动导致的误报
-        if risk_level >= 2:
-            self.alert_frames[track_id] += 1
-        else:
-            self.alert_frames[track_id] = max(0, self.alert_frames[track_id] - 1)
-        
-        # 只有连续多帧高风险的才最终确认
         final_risk = risk_level
-        if risk_level >= 2 and self.alert_frames[track_id] < self.min_alert_frames:
-            # 降级为注意级别
-            final_risk = 1 if risk_level >= 2 else risk_level
         
-        # 历史风险平滑 - 如果最近几帧都是低风险，当前帧也不应突然高风险
-        if len(self.risk_history[track_id]) >= 3:
-            recent_risks = list(self.risk_history[track_id])[-3:]
-            avg_risk = sum(recent_risks) / len(recent_risks)
-            # 如果历史平均风险低，当前突然高风险，可能是误报
-            if avg_risk < 1.0 and final_risk >= 2:
-                final_risk = 1
-        
-        return min(avg_ttc, self.safe_ttc), vx, vy, dw_dt, red_allowed, vw, is_static, final_risk, in_path
+        return min(ttc_effective, self.safe_ttc), vx, vy, dw_dt, red_allowed, vw, is_static, final_risk, in_path
     
     def remove_target(self, track_id: int):
         """移除目标（当目标消失时调用）"""
         self.width_history.pop(track_id, None)
         self.width_ema.pop(track_id, None)
-        self.ttc_history.pop(track_id, None)
         self.x_history.pop(track_id, None)
         self.y_history.pop(track_id, None)
-        self.alert_frames.pop(track_id, None)
-        self.risk_history.pop(track_id, None)
+        self.ground_dist_history.pop(track_id, None)
     
     def clear_all(self):
         """清空所有目标数据"""
         self.width_history.clear()
         self.width_ema.clear()
-        self.ttc_history.clear()
         self.x_history.clear()
         self.y_history.clear()
-        self.alert_frames.clear()
-        self.risk_history.clear()
+        self.ground_dist_history.clear()

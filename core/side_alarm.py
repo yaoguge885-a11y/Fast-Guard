@@ -226,10 +226,19 @@ class SideAlarm:
         else:
             in_red_zone = x1 >= warning_line_x
 
-        if in_red_zone:
+        approach_speed = float(vx)
+        if current_side == "right":
+            approach_speed = -approach_speed
+        approach_fast = approach_speed >= 30.0
+
+        if in_red_zone and approach_fast:
             color = (0, 0, 255)
             label = f"危险！{chinese_class} 进入报警区域"
             thickness = 3
+        elif in_red_zone:
+            color = (0, 255, 255)
+            label = f"注意：{chinese_class} 并行中"
+            thickness = 2
         else:
             color = (0, 255, 0)
             label = f"{chinese_class} {track_id}" if track_id >= 0 else chinese_class

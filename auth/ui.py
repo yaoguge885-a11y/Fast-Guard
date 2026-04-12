@@ -1,6 +1,8 @@
 import os
 import json
+from typing import Optional
 from PyQt5 import QtWidgets, QtCore, QtGui
+
 
 from .db import UserDB
 
@@ -42,6 +44,13 @@ class LoginDialog(QtWidgets.QDialog):
             QCheckBox::indicator {
                 width: 18px;
                 height: 18px;
+                border-radius: 4px;
+                border: 1px solid #3f3f46;
+                background-color: #111111;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #6366f1;
+                border: 1px solid #6366f1;
             }
             QPushButton {
                 background-color: #27272a;
@@ -167,7 +176,15 @@ class LoginDialog(QtWidgets.QDialog):
         layout.addLayout(form)
 
         self.checkbox_remember = QtWidgets.QCheckBox("保持登录状态")
-        layout.addWidget(self.checkbox_remember, alignment=QtCore.Qt.AlignCenter)
+        self.checkbox_remember_password = QtWidgets.QCheckBox("记住密码")
+        remember_layout = QtWidgets.QHBoxLayout()
+        remember_layout.setSpacing(16)
+        remember_layout.addStretch()
+        remember_layout.addWidget(self.checkbox_remember)
+        remember_layout.addWidget(self.checkbox_remember_password)
+        remember_layout.addStretch()
+        layout.addLayout(remember_layout)
+
 
         layout.addStretch()
 
@@ -196,6 +213,8 @@ class LoginDialog(QtWidgets.QDialog):
         self.btn_login.clicked.connect(self.handle_login)
         self.btn_cancel_login.clicked.connect(self.reject)
         self.btn_go_register.clicked.connect(self.switch_to_register)
+        self.checkbox_remember_password.toggled.connect(self._on_remember_password_toggled)
+
 
 
     def _setup_register_page(self):
@@ -291,18 +310,39 @@ class LoginDialog(QtWidgets.QDialog):
             self._remember_data = data
             if data.get("username"):
                 self.input_user.setText(str(data.get("username")))
-            if data.get("remember"):
+            remember = bool(data.get("remember"))
+            remember_password = bool(data.get("remember_password"))
+            if remember:
                 self.checkbox_remember.setChecked(True)
+            if remember_password:
+                self.checkbox_remember_password.setChecked(True)
+                if data.get("password"):
+                    self.input_pass.setText(str(data.get("password")))
+            else:
+                self.input_pass.clear()
+            if remember and remember_password and data.get("password"):
+                self._try_auto_login()
         except Exception:
             self._remember_data = {}
 
-    def _save_remember(self, username: str):
+    def _save_remember(
+        self,
+        username: str,
+        remember: bool = False,
+        password: Optional[str] = None,
+        remember_password: bool = False
+    ):
         data = {
-            "remember": True,
-            "username": username
+            "remember": bool(remember),
+            "username": username,
+            "remember_password": bool(remember_password)
         }
+        if remember_password and password:
+            data["password"] = password
         with open(self._remember_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+
+
 
     def _clear_remember(self):
         if os.path.exists(self._remember_path):
@@ -310,6 +350,21 @@ class LoginDialog(QtWidgets.QDialog):
                 os.remove(self._remember_path)
             except Exception:
                 pass
+
+    def _on_remember_password_toggled(self, checked: bool):
+        if checked and not self.checkbox_remember.isChecked():
+            self.checkbox_remember.setChecked(True)
+
+    def _try_auto_login(self):
+        username = self.input_user.text().strip()
+        password = self.input_pass.text().strip()
+        if not username or not password:
+            return
+        role = self.user_db.verify_user(username, password)
+        if role:
+            self.username = username
+            self.role = role
+            self.accept()
 
     def _show_msg(self, msg_type, title, text):
         msg = QtWidgets.QMessageBox(self)
@@ -324,6 +379,7 @@ class LoginDialog(QtWidgets.QDialog):
         msg.setWindowFlags(QtCore.Qt.Dialog | QtCore.Qt.WindowStaysOnTopHint)
         msg.exec_()
 
+
     def handle_login(self):
         username = self.input_user.text().strip()
         password = self.input_pass.text().strip()
@@ -334,10 +390,17 @@ class LoginDialog(QtWidgets.QDialog):
         if role:
             self.username = username
             self.role = role
-            if self.checkbox_remember.isChecked():
-                self._save_remember(username)
+            if self.checkbox_remember.isChecked() or self.checkbox_remember_password.isChecked():
+                self._save_remember(
+                    username,
+                    remember=self.checkbox_remember.isChecked(),
+                    password=password if self.checkbox_remember_password.isChecked() else None,
+                    remember_password=self.checkbox_remember_password.isChecked()
+                )
             else:
                 self._clear_remember()
+
+
             self.accept()
         else:
             self._show_msg("critical", "登录失败", "用户名或密码错误")

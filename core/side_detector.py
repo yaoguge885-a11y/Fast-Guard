@@ -59,12 +59,13 @@ class SideDetectorConfig:
     bsd_warning_distance: float = 2.0 # 盲区警告距离（米），增加到2米
     
     # TTL（侧向侵入时间）参数
-    ttl_danger_threshold: float = 1.0 # TTL 危险阈值（秒）
-    ttl_warning_threshold: float = 2.0 # TTL 警告阈值（秒）
+    ttl_danger_threshold: float = 1.3 # TTL 危险阈值（秒）
+    ttl_warning_threshold: float = 2.5 # TTL 警告阈值（秒）
     
     # 速度阈值参数
-    min_approach_speed: float = 0.3   # 最小靠近速度（米/秒）
+    min_approach_speed: float = 0.2   # 最小靠近速度（米/秒）
     max_safe_speed: float = 0.1       # 安全速度阈值（米/秒）
+
     
     # 历史数据参数
     history_length: int = 8           # 历史轨迹长度（帧）
@@ -74,7 +75,13 @@ class SideDetectorConfig:
     use_ema: bool = True              # 是否使用 EMA 平滑
     ema_alpha: float = 0.4            # EMA 系数
     
+    # 方向一致性门控
+    approach_consistency_frames: int = 4   # 方向一致性窗口
+    approach_consistency_ratio: float = 0.5 # 一致性比例阈值
+
+    
     # 静态目标过滤
+
     static_threshold: float = 0.3     # 静态判定阈值（米）
     static_frames: int = 8            # 静态判定帧数
     
@@ -144,8 +151,12 @@ class SideCollisionDetector:
         # 距离变化历史（用于判定 is_approaching）
         self._distance_history: Dict[int, deque] = {}
         
+        # 横向靠近方向一致性历史
+        self._approach_dir_history: Dict[int, deque] = {}
+        
         # 车体偏移补偿
         self._body_offset = self.config.body_offset
+
     
     def update(
         self,
@@ -188,8 +199,10 @@ class SideCollisionDetector:
             self._vx_history[track_id] = deque(maxlen=cfg.velocity_smooth_frames)
             self._vy_history[track_id] = deque(maxlen=cfg.velocity_smooth_frames)
             self._distance_history[track_id] = deque(maxlen=cfg.history_length)
+            self._approach_dir_history[track_id] = deque(maxlen=cfg.approach_consistency_frames)
             self._x_ema[track_id] = x
             self._vx_ema[track_id] = 0.0
+
         
         # 更新位置历史
         self._x_history[track_id].append(x)
@@ -222,8 +235,19 @@ class SideCollisionDetector:
         else:
             vx_smooth = vx
         
+        # 记录横向靠近方向一致性（正值表示靠近）
+        x_raw = self._x_history[track_id][-1]
+        approaching_speed = (-vx_smooth) if x_raw > 0 else vx_smooth
+        if approaching_speed > 1e-6:
+            self._approach_dir_history[track_id].append(1)
+        elif approaching_speed < -1e-6:
+            self._approach_dir_history[track_id].append(-1)
+        else:
+            self._approach_dir_history[track_id].append(0)
+        
         # 判断是否在监控区域（传入distance_x用于贴身车辆检测）
         in_monitor_zone = self._is_in_monitor_zone(x_smooth, y, distance_x)
+
         
         if not in_monitor_zone:
             return None
@@ -427,7 +451,7 @@ class SideCollisionDetector:
     
     def _is_approaching(self, track_id: int) -> bool:
         """
-        判断目标是否正在靠近（使用 vx_ema 进行更稳定的判断）
+        判断目标是否正在靠近（EMA + 方向一致性）
         同时考虑纵向速度，对于后方目标，只有当它向前行驶时才认为在靠近
         
         Args:
@@ -436,7 +460,7 @@ class SideCollisionDetector:
         Returns:
             是否正在靠近
         """
-        # 使用 vx_ema（指数移动平均速度）来判断运动趋势
+        cfg = self.config
         vx_ema = self._vx_ema.get(track_id, 0.0)
 
         # 使用原始 x_history 中的值来判断目标在左侧还是右侧（不受 body_offset 影响）
@@ -455,7 +479,6 @@ class SideCollisionDetector:
             vy_ema = vy_hist[-1]  # 使用最新速度
 
         # 对于后方目标（y < 0），需要它正在向前行驶（vy > 0）才算在靠近
-        # 如果它在后方但正在向后行驶，说明它在远离，不应该报警
         if y_raw < 0 and vy_ema < 0:
             return False
 
@@ -464,15 +487,27 @@ class SideCollisionDetector:
             return False
 
         # 计算横向靠近速度（正值表示靠近）
-        # 右侧目标(x_raw>0)：vx_ema < 0 表示靠近
-        # 左侧目标(x_raw<0)：vx_ema > 0 表示靠近
         if x_raw > 0:
             approaching_speed = -vx_ema
         else:
             approaching_speed = vx_ema
 
-        # 只有当横向靠近速度超过阈值时才判定为正在靠近
-        return approaching_speed > self.config.min_approach_speed
+        # 速度幅度门控
+        if approaching_speed <= cfg.min_approach_speed:
+            return False
+
+        # 方向一致性门控（最近窗口内多数为“靠近”）
+        dir_hist = self._approach_dir_history.get(track_id, deque())
+        if len(dir_hist) == 0:
+            return False
+        window = list(dir_hist)[-cfg.approach_consistency_frames:]
+        positives = sum(1 for v in window if v > 0)
+        required = max(2, int(math.ceil(len(window) * cfg.approach_consistency_ratio)))
+        if positives < required:
+            return False
+
+        return True
+
     
     def _calculate_ttl(self, distance_x: float, vx: float, is_approaching: bool) -> float:
         """
@@ -520,8 +555,8 @@ class SideCollisionDetector:
             if vy < -1.0 and not is_approaching:
                 return 0
             # 有明确的横向靠近趋势才控车
-            if is_approaching and approach_speed > 0.3:
-                return 2 if ttl < 1.5 else 1
+            if is_approaching and approach_speed > 0.2:
+                return 2 if ttl < 2.0 else 1
             # 在极近区但未明显靠近，保守性黄色预警
             return 1
 
@@ -529,9 +564,10 @@ class SideCollisionDetector:
         if distance_x < 4.0:
             if vy < -1.0 and not is_approaching:
                 return 0
-            if is_approaching and approach_speed > 0.5:
+            if is_approaching and approach_speed > 0.4:
                 return 1
             return 0
+
 
         # ========== 安全区（X ≥ 4.0m）==========
         return 0
@@ -633,8 +669,10 @@ class SideCollisionDetector:
         self._vx_history.pop(track_id, None)
         self._vy_history.pop(track_id, None)
         self._distance_history.pop(track_id, None)
+        self._approach_dir_history.pop(track_id, None)
         self._x_ema.pop(track_id, None)
         self._vx_ema.pop(track_id, None)
+
         self._class_names.pop(track_id, None)
         self._seen_frames.pop(track_id, None)
         self._static_targets.discard(track_id)
@@ -647,8 +685,10 @@ class SideCollisionDetector:
         self._vx_history.clear()
         self._vy_history.clear()
         self._distance_history.clear()
+        self._approach_dir_history.clear()
         self._x_ema.clear()
         self._vx_ema.clear()
+
         self._class_names.clear()
         self._seen_frames.clear()
         self._static_targets.clear()

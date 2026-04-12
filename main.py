@@ -1109,6 +1109,7 @@ class VideoThread(QtCore.QThread):
                         v_self_mps=self.v_self_mps,
                         t_reaction=self.t_reaction,
                         d_safe=self.d_safe,
+                        ipm=self.current_ipm,
                     )
 
                 v_rel = None
@@ -1199,20 +1200,20 @@ class VideoThread(QtCore.QThread):
                     color, label, thickness = self.front_alarm.get_display_params(
                         track_id, class_name, ttc, y2, warning_line_y, lateral_fast, red_ok
                     )
-                else:
-                    # 侧面视角：使用强制设置的标签（包含调试信息）
-                    if risk_level == 2:
+                    # 前向报警时强制将框标红
+                    if risk_level >= 2:
                         color = (0, 0, 255)
-                        thickness = 3
-                    elif risk_level == 1:
-                        color = (0, 255, 255)
-                        thickness = 2
-                    else:
-                        color = (0, 255, 0)
-                        thickness = 2           
-                    # 确保 label 已定义（如果之前的代码路径没有设置，使用默认值）
-                    if 'label' not in locals():
-                        label = f"[{track_id}] {class_name}"
+                        thickness = max(thickness, 3)
+                else:
+                    # 侧面视角：使用 SideAlarm 的显示参数（含横向靠近门控）
+                    color, label_disp, thickness = self.side_alarm.get_display_params(
+                        track_id, class_name, ttc, x1, x2, vx, warning_line_x, yellow_line_x
+                    )
+                    # 侧向切入报警时强制红框
+                    if risk_level >= 2:
+                        color = (0, 0, 255)
+                        thickness = max(thickness, 3)
+                    label = f"{label_disp} {debug_info}" if debug_info else label_disp
                 # 根据视角绘制L型角框
                 if self.current_perspective == "前向视角":
                     frame = self.front_alarm.draw_l_corners(frame, x1, y1, x2, y2, color, thickness=thickness, seg=18)
