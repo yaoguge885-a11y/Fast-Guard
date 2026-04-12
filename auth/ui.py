@@ -24,9 +24,9 @@ class LoginDialog(QtWidgets.QDialog):
                 background-color: #111111;
                 border: 1px solid #3f3f46;
                 border-radius: 8px;
-                padding: 12px 14px;
+                padding: 24px 28px;
                 color: #ffffff;
-                font-size: 14px;
+                font-size: 42px;
             }
             QLineEdit:focus {
                 border: 1px solid #6366f1;
@@ -37,13 +37,13 @@ class LoginDialog(QtWidgets.QDialog):
             }
             QCheckBox {
                 color: #a1a1aa;
-                spacing: 8px;
+                spacing: 12px;
                 background: transparent;
-                font-size: 14px;
+                font-size: 28px;
             }
             QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
+                width: 32px;
+                height: 32px;
                 border-radius: 4px;
                 border: 1px solid #3f3f46;
                 background-color: #111111;
@@ -57,8 +57,8 @@ class LoginDialog(QtWidgets.QDialog):
                 color: #ffffff;
                 border: 1px solid #3f3f46;
                 border-radius: 8px;
-                padding: 10px 16px;
-                font-size: 14px;
+                padding: 20px 28px;
+                font-size: 36px;
                 font-weight: bold;
             }
             QPushButton:hover {
@@ -105,7 +105,7 @@ class LoginDialog(QtWidgets.QDialog):
         self.username = ""
         self.role = ""
         self.setWindowTitle("FastGuard 登录与注册")
-        self.setFixedSize(480, 560)
+        self.setFixedSize(900, 1000)
         self.setModal(True)
         self.setWindowFlags(QtCore.Qt.FramelessWindowHint)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground)
@@ -148,17 +148,17 @@ class LoginDialog(QtWidgets.QDialog):
 
         # Logo and Title
         logo_label = QtWidgets.QLabel("❖")
-        logo_label.setStyleSheet("font-size: 64px; color: #6366f1; margin-bottom: 0px;")
+        logo_label.setStyleSheet("font-size: 120px; color: #6366f1; margin-bottom: 0px;")
         logo_label.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(logo_label)
 
         title = QtWidgets.QLabel("FastGuard")
-        title.setStyleSheet("font-size: 28px; font-weight: 900; letter-spacing: 2px;")
+        title.setStyleSheet("font-size: 56px; font-weight: 900; letter-spacing: 2px;")
         title.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(title)
 
         subtitle = QtWidgets.QLabel("欢迎回来，请登录您的账号")
-        subtitle.setStyleSheet("color: #a1a1aa; font-size: 14px; margin-bottom: 10px;")
+        subtitle.setStyleSheet("color: #a1a1aa; font-size: 28px; margin-bottom: 10px;")
         subtitle.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(subtitle)
 
@@ -193,11 +193,11 @@ class LoginDialog(QtWidgets.QDialog):
 
         self.btn_login = QtWidgets.QPushButton("登 录")
         self.btn_login.setObjectName("primaryBtn")
-        self.btn_login.setFixedHeight(46)
+        self.btn_login.setFixedHeight(80)
         
         self.btn_cancel_login = QtWidgets.QPushButton("退 出 系 统")
         self.btn_cancel_login.setObjectName("btnCancel")
-        self.btn_cancel_login.setFixedHeight(46)
+        self.btn_cancel_login.setFixedHeight(80)
         
         self.btn_go_register = QtWidgets.QPushButton("没有账号？立即注册 ➔")
         self.btn_go_register.setObjectName("switchBtn")
@@ -225,12 +225,12 @@ class LoginDialog(QtWidgets.QDialog):
 
         # Logo and Title
         logo_label = QtWidgets.QLabel("✧")
-        logo_label.setStyleSheet("font-size: 64px; color: #10b981; margin-bottom: 0px;")
+        logo_label.setStyleSheet("font-size: 120px; color: #10b981; margin-bottom: 0px;")
         logo_label.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(logo_label)
 
         title = QtWidgets.QLabel("创建新账号")
-        title.setStyleSheet("font-size: 26px; font-weight: 800; letter-spacing: 2px;")
+        title.setStyleSheet("font-size: 54px; font-weight: 800; letter-spacing: 2px;")
         title.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(title)
 
@@ -257,7 +257,7 @@ class LoginDialog(QtWidgets.QDialog):
         layout.addLayout(form)
 
         hint = QtWidgets.QLabel("提示：建议使用字母+数字组合。")
-        hint.setStyleSheet("color: #9ca3af; font-size: 12px;")
+        hint.setStyleSheet("color: #9ca3af; font-size: 24px;")
         hint.setAlignment(QtCore.Qt.AlignLeft)
         layout.addWidget(hint)
 
@@ -268,7 +268,7 @@ class LoginDialog(QtWidgets.QDialog):
 
         self.btn_create = QtWidgets.QPushButton("立 即 注 册")
         self.btn_create.setObjectName("regPrimaryBtn")
-        self.btn_create.setFixedHeight(46)
+        self.btn_create.setFixedHeight(80)
         
         self.btn_go_login = QtWidgets.QPushButton("⬅ 返回登录")
         self.btn_go_login.setObjectName("switchBtn")
