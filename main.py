@@ -1984,6 +1984,8 @@ class MainWindow(QtWidgets.QWidget):
 
         main_split.addWidget(self.views_container, stretch=3)
 
+
+
         # --- Right Column: Stats & Controls ---
         self.right_widget = QtWidgets.QWidget()
         self.right_widget.setFixedWidth(360) # Wider for new card style and larger text
@@ -2126,11 +2128,77 @@ class MainWindow(QtWidgets.QWidget):
         right_column.addStretch()
 
         main_split.addWidget(self.right_widget)
-        content_layout.addLayout(main_split)
-        main_layout.addWidget(content_widget)
+        content_layout.addLayout(main_split, stretch=1)
+
+        # --- Log Viewer (Terminal-style) ---
+        log_header = QtWidgets.QWidget()
+        log_header_layout = QtWidgets.QHBoxLayout(log_header)
+        log_header_layout.setContentsMargins(0, 0, 0, 0)
+        log_header_layout.setSpacing(12)
+
+        log_title = QtWidgets.QLabel("日志")
+        log_title.setStyleSheet("color: #71717a; font-size: 14px; font-weight: 700; letter-spacing: 2px; font-family: 'Microsoft YaHei';")
+
+        self.log_toggle_btn = QtWidgets.QToolButton()
+        self.log_toggle_btn.setText("展开日志")
+        self.log_toggle_btn.setCheckable(True)
+        self.log_toggle_btn.setChecked(False)
+        self.log_toggle_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.log_toggle_btn.setStyleSheet("""
+            QToolButton {
+                background-color: #27272a;
+                color: #e4e4e7;
+                border: 1px solid #3f3f46;
+                border-radius: 6px;
+                padding: 6px 12px;
+                font-size: 12px;
+            }
+            QToolButton:hover { background-color: #3f3f46; }
+        """)
+
+        log_header_layout.addWidget(log_title)
+        log_header_layout.addStretch()
+        log_header_layout.addWidget(self.log_toggle_btn)
+
+        self.log_viewer = QtWidgets.QTextEdit()
+        self.log_viewer.setObjectName("log_viewer")
+        self.log_viewer.setReadOnly(True)
+        self.log_viewer.setFixedHeight(150)
+        self.log_viewer.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.log_viewer.setStyleSheet("""
+            QTextEdit#log_viewer {
+                background-color: rgba(0, 0, 0, 150);
+                color: #a7f3d0; /* 淡绿色 */
+                border: 1px solid #27272a;
+                border-radius: 10px;
+                padding: 10px;
+                font-family: 'Consolas', 'Microsoft YaHei Mono', monospace;
+                font-size: 9pt;
+            }
+        """)
+        self.log_viewer.setVisible(False)
+
+        content_layout.addWidget(log_header, stretch=0)
+        content_layout.addWidget(self.log_viewer, stretch=0)
+
+
+        # Scroll Area to allow vertical scrolling when content overflows
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll_area.setStyleSheet("""
+            QScrollArea { background: #09090b; }
+            QScrollArea > QWidget > QWidget { background: #09090b; }
+        """)
+        scroll_area.setWidget(content_widget)
+        main_layout.addWidget(scroll_area)
+
 
         # Footer
         self.footer_label = QtWidgets.QLabel("系统就绪，等待输入源...")
+
+
+
         self.footer_label.setStyleSheet("color: #52525b; font-size: 14px; margin-top: 8px; font-family: 'Microsoft YaHei', sans-serif;")
         self.footer_label.setAlignment(QtCore.Qt.AlignRight)
         content_layout.addWidget(self.footer_label)
@@ -2146,14 +2214,25 @@ class MainWindow(QtWidgets.QWidget):
             self.btn_admin.clicked.connect(self.admin_panel.show)
 
         self.btn_help.clicked.connect(self.show_help_dialog)
+        if hasattr(self, "log_toggle_btn"):
+            self.log_toggle_btn.toggled.connect(self.toggle_log_viewer)
 
         self.pause_btn.toggled.connect(self.toggle_pause)
+
         self.progress_slider.sliderPressed.connect(self.on_slider_pressed)
         self.progress_slider.sliderMoved.connect(self.on_slider_moved)
         self.progress_slider.sliderReleased.connect(self.on_slider_released)
         self.stop_btn.clicked.connect(self.stop_camera)
 
+    def toggle_log_viewer(self, checked):
+        if not hasattr(self, "log_viewer"):
+            return
+        self.log_viewer.setVisible(checked)
+        if hasattr(self, "log_toggle_btn"):
+            self.log_toggle_btn.setText("收起日志" if checked else "展开日志")
+
     def show_help_dialog(self):
+
         if getattr(self, "help_dialog", None):
             self.help_dialog.show()
             self.help_dialog.raise_()
@@ -2626,6 +2705,7 @@ class MainWindow(QtWidgets.QWidget):
         log_msg = f"⚡ [{timestamp}] ID:{track_id} TTC:{ttc:.1f}s"
         self.log_db.add_log(self.current_user, "event", f"ID:{track_id} TTC:{ttc:.1f}s", "front")
         self.log_window.add_log_entry(log_msg)
+        self.append_to_log_viewer(log_msg)
 
 
     def append_system_log(self, message):
@@ -2633,9 +2713,19 @@ class MainWindow(QtWidgets.QWidget):
         log_msg = f"ℹ️ [{timestamp}] {message}"
         self.log_db.add_log(self.current_user, "info", message, "system")
         self.log_window.add_log_entry(log_msg)
+        self.append_to_log_viewer(log_msg)
+
+
+    def append_to_log_viewer(self, text):
+        if not hasattr(self, "log_viewer"):
+            return
+        self.log_viewer.append(text)
+        self.log_viewer.moveCursor(QtGui.QTextCursor.End)
+        self.log_viewer.ensureCursorVisible()
 
 
     def update_model_name(self, name):
+
 
         self.model_name = name
         self.update_footer()
