@@ -1504,12 +1504,12 @@ class StatCard(QtWidgets.QFrame):
 
         icon_label = QtWidgets.QLabel(icon_text)
         # Circular icon background
-        icon_label.setStyleSheet(f"font-size: 28px; color: {color}; background: {color}20; border-radius: 12px; padding: 8px;")
+        icon_label.setStyleSheet(f"font-size: 42px; color: {color}; background: {color}20; border-radius: 12px; padding: 8px;")
         icon_label.setFixedSize(52, 52)
         icon_label.setAlignment(QtCore.Qt.AlignCenter)
         
         title_label = QtWidgets.QLabel(title)
-        title_label.setStyleSheet("font-size: 18px; color: #a1a1aa; font-weight: 600; letter-spacing: 1px;")
+        title_label.setStyleSheet("font-size: 27px; color: #a1a1aa; font-weight: 600; letter-spacing: 1px;")
         
         header_layout.addWidget(icon_label)
         header_layout.addWidget(title_label)
@@ -1521,10 +1521,10 @@ class StatCard(QtWidgets.QFrame):
         value_layout.setContentsMargins(0, 12, 0, 0)
 
         self.value_label = QtWidgets.QLabel(value)
-        self.value_label.setStyleSheet("font-size: 42px; color: #ffffff; font-weight: 700; font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;")
+        self.value_label.setStyleSheet("font-size: 63px; color: #ffffff; font-weight: 700; font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;")
         
         self.unit_label = QtWidgets.QLabel(unit)
-        self.unit_label.setStyleSheet("font-size: 16px; color: #71717a; font-weight: 600; padding-bottom: 8px;")
+        self.unit_label.setStyleSheet("font-size: 24px; color: #71717a; font-weight: 600; padding-bottom: 8px;")
         
         value_layout.addWidget(self.value_label)
         value_layout.addWidget(self.unit_label, alignment=QtCore.Qt.AlignBottom)
@@ -1549,7 +1549,7 @@ class LogWindow(QtWidgets.QDialog):
         self.resize(700, 720)
         self.setStyleSheet("""
             QDialog { background-color: #09090b; }
-            QLabel { color: white; font-size: 18px; font-weight: bold; font-family: 'Microsoft YaHei'; }
+            QLabel { color: white; font-size: 27px; font-weight: bold; font-family: 'Microsoft YaHei'; }
         """)
         
         layout = QtWidgets.QVBoxLayout(self)
@@ -1564,7 +1564,7 @@ class LogWindow(QtWidgets.QDialog):
                 border-radius: 8px;
                 color: #a1a1aa;
                 font-family: 'Consolas', 'Microsoft YaHei Mono', monospace;
-                font-size: 14px;
+                font-size: 21px;
                 outline: none;
             }
             QListWidget::item { padding: 6px; }
@@ -1740,7 +1740,7 @@ class MainWindow(QtWidgets.QWidget):
         # === Left Sidebar ===
         self.sidebar = QtWidgets.QFrame()
         self.sidebar.setObjectName("sidebar")
-        self.sidebar.setFixedWidth(280)  # Wider for larger Chinese text
+        self.sidebar.setFixedWidth(370)  # Adjusted width for larger Chinese text and larger fonts
         
         sidebar_layout = QtWidgets.QVBoxLayout(self.sidebar)
         sidebar_layout.setContentsMargins(24, 40, 24, 40)
@@ -1750,11 +1750,11 @@ class MainWindow(QtWidgets.QWidget):
         app_logo_layout = QtWidgets.QHBoxLayout()
         # Use a geometric shape for a more sci-fi look
         logo_icon = QtWidgets.QLabel("❖") 
-        logo_icon.setStyleSheet("font-size: 32px; color: #6366f1; background: transparent;")
+        logo_icon.setStyleSheet("font-size: 48px; color: #6366f1; background: transparent;")
         logo_text = QtWidgets.QLabel("FASTGUARD")
         logo_text.setStyleSheet("""
             font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
-            font-size: 26px; 
+            font-size: 39px; 
             font-weight: 800; 
             color: #ffffff; 
             letter-spacing: 2px;
@@ -1766,15 +1766,48 @@ class MainWindow(QtWidgets.QWidget):
         
         sidebar_layout.addLayout(app_logo_layout)
 
+        # User Info and Logout Section
+        user_container = QtWidgets.QWidget()
+        user_layout = QtWidgets.QHBoxLayout(user_container)
+        user_layout.setContentsMargins(0, 0, 0, 0)
+        user_layout.setSpacing(10)
+        
         self.user_label = QtWidgets.QLabel(f"当前用户：{self.current_user}")
-        self.user_label.setStyleSheet("color: #a1a1aa; font-size: 14px; font-weight: 600; font-family: 'Microsoft YaHei';")
-        sidebar_layout.addWidget(self.user_label)
+        self.user_label.setStyleSheet("color: #a1a1aa; font-size: 21px; font-weight: 600; font-family: 'Microsoft YaHei';")
+        user_layout.addWidget(self.user_label)
+        
+        # Logout Button
+        self.btn_logout = QtWidgets.QPushButton("退出登录")
+        self.btn_logout.setStyleSheet("""
+            QPushButton {
+                background-color: #7f1d1d;
+                color: #fca5a5;
+                border: 1px solid #dc2626;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-size: 18px;
+                font-weight: 600;
+                font-family: 'Microsoft YaHei';
+            }
+            QPushButton:hover {
+                background-color: #991b1b;
+                color: #fecaca;
+                border: 1px solid #ef4444;
+            }
+            QPushButton:pressed {
+                background-color: #7f1d1d;
+            }
+        """)
+        self.btn_logout.setCursor(QtCore.Qt.PointingHandCursor)
+        user_layout.addWidget(self.btn_logout)
+        
+        sidebar_layout.addWidget(user_container)
         sidebar_layout.addSpacing(30)
 
 
         # Menu Group: MAIN
         lbl_main = QtWidgets.QLabel("主菜单")
-        lbl_main.setStyleSheet("color: #71717a; font-size: 14px; font-weight: 700; letter-spacing: 2px; margin-bottom: 8px; font-family: 'Microsoft YaHei';")
+        lbl_main.setStyleSheet("color: #71717a; font-size: 21px; font-weight: 700; letter-spacing: 2px; margin-bottom: 8px; font-family: 'Microsoft YaHei';")
         sidebar_layout.addWidget(lbl_main)
 
         def create_nav_btn(icon, text, tooltip, is_active=False):
@@ -1797,7 +1830,7 @@ class MainWindow(QtWidgets.QWidget):
         
         # Menu Group: TOOLS
         lbl_tools = QtWidgets.QLabel("工具")
-        lbl_tools.setStyleSheet("color: #71717a; font-size: 14px; font-weight: 700; letter-spacing: 2px; margin-bottom: 8px; font-family: 'Microsoft YaHei';")
+        lbl_tools.setStyleSheet("color: #71717a; font-size: 21px; font-weight: 700; letter-spacing: 2px; margin-bottom: 8px; font-family: 'Microsoft YaHei';")
         sidebar_layout.addWidget(lbl_tools)
         
         self.btn_log = create_nav_btn("📟", "系统日志", "查看运行日志")
@@ -1812,7 +1845,7 @@ class MainWindow(QtWidgets.QWidget):
         
         # Menu Group: SYSTEM
         lbl_system = QtWidgets.QLabel("系统")
-        lbl_system.setStyleSheet("color: #71717a; font-size: 14px; font-weight: 700; letter-spacing: 2px; margin-bottom: 8px; font-family: 'Microsoft YaHei';")
+        lbl_system.setStyleSheet("color: #71717a; font-size: 21px; font-weight: 700; letter-spacing: 2px; margin-bottom: 8px; font-family: 'Microsoft YaHei';")
         sidebar_layout.addWidget(lbl_system)
         
         self.btn_help = create_nav_btn("?", "使用帮助", "用户指南")
@@ -1830,7 +1863,7 @@ class MainWindow(QtWidgets.QWidget):
                 border-radius: 8px;
                 color: #a1a1aa; /* Zinc-400 */
                 font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
-                font-size: 18px;
+                font-size: 27px;
                 font-weight: 500;
                 text-align: left;
                 padding-left: 16px;
@@ -1865,29 +1898,14 @@ class MainWindow(QtWidgets.QWidget):
         # Title with accent
         title_box = QtWidgets.QVBoxLayout()
         app_title = QtWidgets.QLabel("开启摄像头")
-        app_title.setStyleSheet("font-size: 42px; font-weight: 800; color: #ffffff; letter-spacing: 2px; font-family: 'Microsoft YaHei';")
+        app_title.setStyleSheet("font-size: 63px; font-weight: 800; color: #ffffff; letter-spacing: 2px; font-family: 'Microsoft YaHei';")
         app_subtitle = QtWidgets.QLabel("实时智能监控系统")
-        app_subtitle.setStyleSheet("font-size: 20px; font-weight: 500; color: #71717a; letter-spacing: 1px; font-family: 'Microsoft YaHei'; margin-top: 4px;")
+        app_subtitle.setStyleSheet("font-size: 30px; font-weight: 500; color: #71717a; letter-spacing: 1px; font-family: 'Microsoft YaHei'; margin-top: 4px;")
         title_box.addWidget(app_title)
         title_box.addWidget(app_subtitle)
         
         header_layout.addLayout(title_box)
         header_layout.addStretch()
-        
-        # System Status Indicator (Top Right)
-        status_badge = QtWidgets.QLabel("  ● 系统在线  ")
-        status_badge.setStyleSheet("""
-            background-color: #064e3b; /* Emerald-900 */
-            color: #34d399; /* Emerald-400 */
-            border: 1px solid #059669; /* Emerald-600 */
-            border-radius: 16px;
-            padding: 8px 16px;
-            font-size: 16px;
-            font-weight: 700;
-            letter-spacing: 1px;
-            font-family: 'Microsoft YaHei';
-        """)
-        header_layout.addWidget(status_badge)
         
         content_layout.addWidget(header_container)
 
@@ -1930,11 +1948,11 @@ class MainWindow(QtWidgets.QWidget):
             
             # Title
             lbl_title = QtWidgets.QLabel(title)
-            lbl_title.setStyleSheet("color: #e4e4e7; font-weight: 600; font-size: 16px; border: none; background: transparent; font-family: 'Microsoft YaHei';")
+            lbl_title.setStyleSheet("color: #e4e4e7; font-weight: 600; font-size: 24px; border: none; background: transparent; font-family: 'Microsoft YaHei';")
             
             # Live Indicator
             lbl_live = QtWidgets.QLabel("● 实时")
-            lbl_live.setStyleSheet("color: #ef4444; font-weight: 700; font-size: 14px; border: none; background: transparent; letter-spacing: 1px; font-family: 'Microsoft YaHei';")
+            lbl_live.setStyleSheet("color: #ef4444; font-weight: 700; font-size: 21px; border: none; background: transparent; letter-spacing: 1px; font-family: 'Microsoft YaHei';")
             
             vh_layout.addWidget(lbl_title)
             vh_layout.addStretch()
@@ -1956,7 +1974,7 @@ class MainWindow(QtWidgets.QWidget):
             lbl_img.setScaledContents(False) # Keep aspect ratio logic in update_frame
             # Placeholder text style
             lbl_img.setText("无信号")
-            lbl_img.setStyleSheet("color: #52525b; font-weight: 600; font-family: 'Microsoft YaHei', sans-serif; font-size: 24px; border: none;")
+            lbl_img.setStyleSheet("color: #52525b; font-weight: 600; font-family: 'Microsoft YaHei', sans-serif; font-size: 36px; border: none;")
 
             container_layout.addWidget(lbl_img)
             layout.addWidget(container)
@@ -1995,7 +2013,7 @@ class MainWindow(QtWidgets.QWidget):
 
         # Metrics Section
         lbl_metrics = QtWidgets.QLabel("核心指标")
-        lbl_metrics.setStyleSheet("color: #71717a; font-size: 16px; font-weight: 700; letter-spacing: 2px; font-family: 'Microsoft YaHei';")
+        lbl_metrics.setStyleSheet("color: #71717a; font-size: 24px; font-weight: 700; letter-spacing: 2px; font-family: 'Microsoft YaHei';")
         right_column.addWidget(lbl_metrics)
 
         self.card_fps = StatCard("系统帧率", "0.0", "赫兹", "⚡", "#10b981") # Emerald
@@ -2010,7 +2028,7 @@ class MainWindow(QtWidgets.QWidget):
 
         # Controls Section
         lbl_controls = QtWidgets.QLabel("控制面板")
-        lbl_controls.setStyleSheet("color: #71717a; font-size: 16px; font-weight: 700; letter-spacing: 2px; font-family: 'Microsoft YaHei';")
+        lbl_controls.setStyleSheet("color: #71717a; font-size: 24px; font-weight: 700; letter-spacing: 2px; font-family: 'Microsoft YaHei';")
         right_column.addWidget(lbl_controls)
 
         controls_frame = QtWidgets.QFrame()
@@ -2029,11 +2047,11 @@ class MainWindow(QtWidgets.QWidget):
         # Time Display
         time_container = QtWidgets.QHBoxLayout()
         icon_time = QtWidgets.QLabel("⏱")
-        icon_time.setStyleSheet("color: #71717a; font-size: 20px; border: none; background: transparent;")
+        icon_time.setStyleSheet("color: #71717a; font-size: 30px; border: none; background: transparent;")
         
         self.time_label = QtWidgets.QLabel("00:00 / 00:00")
         self.time_label.setAlignment(QtCore.Qt.AlignRight)
-        self.time_label.setStyleSheet("color: #e4e4e7; font-family: 'Consolas', monospace; font-size: 24px; font-weight: 600; border: none; background: transparent;")
+        self.time_label.setStyleSheet("color: #e4e4e7; font-family: 'Consolas', monospace; font-size: 36px; font-weight: 600; border: none; background: transparent;")
         
         time_container.addWidget(icon_time)
         time_container.addStretch()
@@ -2083,7 +2101,7 @@ class MainWindow(QtWidgets.QWidget):
                         border-radius: 8px; 
                         padding: 12px; 
                         font-weight: bold; 
-                        font-size: 20px;
+                        font-size: 30px;
                     }
                     QPushButton:hover { background-color: #4f46e5; }
                     QPushButton:checked { background-color: #f59e0b; }
@@ -2173,7 +2191,7 @@ class MainWindow(QtWidgets.QWidget):
                 border-radius: 10px;
                 padding: 10px;
                 font-family: 'Consolas', 'Microsoft YaHei Mono', monospace;
-                font-size: 9pt;
+                font-size: 14pt;
             }
         """)
         self.log_viewer.setVisible(False)
@@ -2199,7 +2217,7 @@ class MainWindow(QtWidgets.QWidget):
 
 
 
-        self.footer_label.setStyleSheet("color: #52525b; font-size: 14px; margin-top: 8px; font-family: 'Microsoft YaHei', sans-serif;")
+        self.footer_label.setStyleSheet("color: #52525b; font-size: 21px; margin-top: 8px; font-family: 'Microsoft YaHei', sans-serif;")
         self.footer_label.setAlignment(QtCore.Qt.AlignRight)
         content_layout.addWidget(self.footer_label)
 
@@ -2208,6 +2226,7 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_open.clicked.connect(self.open_video)
         self.btn_camera.clicked.connect(self.open_camera)
         self.btn_exit.clicked.connect(self.close)
+        self.btn_logout.clicked.connect(self.logout)
         self.btn_log.clicked.connect(self.log_window.show)
         self.btn_settings.clicked.connect(self.settings_window.show)
         if self.btn_admin:
@@ -2260,14 +2279,14 @@ class MainWindow(QtWidgets.QWidget):
                 font-family: 'Segoe UI', sans-serif;
             }
             QLabel#helpSubtitle { 
-                font-size: 14px; 
+                font-size: 21px; 
                 letter-spacing: 1px; 
                 color: #60a5fa; 
                 font-weight: 600; 
                 margin-bottom: 10px;
             }
             QLabel#helpBody { 
-                font-size: 15px; 
+                font-size: 23px; 
                 line-height: 1.8; 
                 color: #d4d4d8;
                 padding: 10px;
@@ -2805,8 +2824,27 @@ class MainWindow(QtWidgets.QWidget):
 
 
     def closeEvent(self, event):
-        if self.thread: self.thread.stop()
+        """窗口关闭事件处理"""
+        if self.thread:
+            self.thread.stop()
         super().closeEvent(event)
+
+    def logout(self):
+        """退出登录，关闭主窗口并返回登录界面"""
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "确认退出登录",
+            f"确定要退出当前账户 {self.current_user} 的登录吗？",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+        
+        if reply == QtWidgets.QMessageBox.Yes:
+            if self.thread:
+                self.thread.stop()
+            # 设置重新登录标志
+            self.need_relogin = True
+            self.close()
 
 
 
@@ -2817,22 +2855,42 @@ def main():
     
     user_db = UserDB()
     log_db = LogDB(user_db.db_path)
-    splash = SplashScreen()
-    window_holder = {"window": None}
-
-    def on_splash_finished():
+    
+    def show_login_dialog():
+        """显示登录对话框并返回登录结果"""
         login = LoginDialog(user_db)
         if login.exec_() == QtWidgets.QDialog.Accepted:
-            window_holder["window"] = MainWindow(user_db, log_db, login.username, login.role)
-            window_holder["window"].show()
+            return login
         else:
-            app.quit()
-
-    # When splash finishes, show login dialog then main window
-    splash.finished.connect(on_splash_finished)
-    splash.show()
+            return None
     
-    sys.exit(app.exec_())
+    def run_main_window(login_result):
+        """运行主窗口并返回是否需要重新登录"""
+        if login_result is None:
+            return False
+        
+        main_window = MainWindow(user_db, log_db, login_result.username, login_result.role)
+        main_window.show()
+        
+        # 运行事件循环，直到主窗口关闭
+        app.exec_()
+        
+        # 检查是否需要重新登录
+        return getattr(main_window, 'need_relogin', False)
+    
+    # 主循环：登录 → 主窗口 → 重新登录/退出
+    while True:
+        login_result = show_login_dialog()
+        if login_result is None:
+            # 用户取消登录，退出程序
+            break
+        
+        need_relogin = run_main_window(login_result)
+        if not need_relogin:
+            # 用户直接关闭窗口，退出程序
+            break
+        
+        # 需要重新登录，继续循环
 
 
 
