@@ -104,6 +104,7 @@ class LoginDialog(QtWidgets.QDialog):
         self.user_db = user_db
         self.username = ""
         self.role = ""
+        self.exit_program = False  # 退出系统标志
         self.setWindowTitle("FastGuard 登录与注册")
         self.setFixedSize(900, 1000)
         self.setModal(True)
@@ -175,18 +176,16 @@ class LoginDialog(QtWidgets.QDialog):
         form.addWidget(self.input_pass)
         layout.addLayout(form)
 
-        self.checkbox_remember = QtWidgets.QCheckBox("保持登录状态")
         self.checkbox_remember_password = QtWidgets.QCheckBox("记住密码")
+        self.checkbox_remember_password.setStyleSheet("font-size: 28px;")
         remember_layout = QtWidgets.QHBoxLayout()
         remember_layout.setSpacing(16)
         remember_layout.addStretch()
-        remember_layout.addWidget(self.checkbox_remember)
         remember_layout.addWidget(self.checkbox_remember_password)
         remember_layout.addStretch()
         layout.addLayout(remember_layout)
 
-
-        layout.addStretch()
+        layout.addSpacing(20)
 
         btn_layout = QtWidgets.QVBoxLayout()
         btn_layout.setSpacing(12)
@@ -211,9 +210,8 @@ class LoginDialog(QtWidgets.QDialog):
         layout.addWidget(self.btn_go_register, alignment=QtCore.Qt.AlignCenter)
 
         self.btn_login.clicked.connect(self.handle_login)
-        self.btn_cancel_login.clicked.connect(self.reject)
+        self.btn_cancel_login.clicked.connect(self.handle_exit)
         self.btn_go_register.clicked.connect(self.switch_to_register)
-        self.checkbox_remember_password.toggled.connect(self._on_remember_password_toggled)
 
 
 
@@ -310,17 +308,14 @@ class LoginDialog(QtWidgets.QDialog):
             self._remember_data = data
             if data.get("username"):
                 self.input_user.setText(str(data.get("username")))
-            remember = bool(data.get("remember"))
             remember_password = bool(data.get("remember_password"))
-            if remember:
-                self.checkbox_remember.setChecked(True)
             if remember_password:
                 self.checkbox_remember_password.setChecked(True)
                 if data.get("password"):
                     self.input_pass.setText(str(data.get("password")))
             else:
                 self.input_pass.clear()
-            if remember and remember_password and data.get("password"):
+            if remember_password and data.get("password"):
                 self._try_auto_login()
         except Exception:
             self._remember_data = {}
@@ -328,12 +323,10 @@ class LoginDialog(QtWidgets.QDialog):
     def _save_remember(
         self,
         username: str,
-        remember: bool = False,
         password: Optional[str] = None,
         remember_password: bool = False
     ):
         data = {
-            "remember": bool(remember),
             "username": username,
             "remember_password": bool(remember_password)
         }
@@ -352,8 +345,8 @@ class LoginDialog(QtWidgets.QDialog):
                 pass
 
     def _on_remember_password_toggled(self, checked: bool):
-        if checked and not self.checkbox_remember.isChecked():
-            self.checkbox_remember.setChecked(True)
+        # 此方法已不再需要，因为移除了保持登录状态按钮
+        pass
 
     def _try_auto_login(self):
         username = self.input_user.text().strip()
@@ -390,20 +383,79 @@ class LoginDialog(QtWidgets.QDialog):
         if role:
             self.username = username
             self.role = role
-            if self.checkbox_remember.isChecked() or self.checkbox_remember_password.isChecked():
-                self._save_remember(
-                    username,
-                    remember=self.checkbox_remember.isChecked(),
-                    password=password if self.checkbox_remember_password.isChecked() else None,
-                    remember_password=self.checkbox_remember_password.isChecked()
-                )
+            
+            # 安全逻辑：管理员账户不保存密码，即使勾选了记住密码
+            if self.checkbox_remember_password.isChecked():
+                if role == "admin":
+                    # 管理员账户：只保存用户名，不保存密码
+                    self._save_remember(
+                        username,
+                        password=None,  # 不保存管理员密码
+                        remember_password=False  # 强制设置为False
+                    )
+                    self._show_msg("info", "安全提示", "管理员账户已登录，出于安全考虑，密码不会被保存。")
+                else:
+                    # 普通用户：正常保存密码
+                    self._save_remember(
+                        username,
+                        password=password,
+                        remember_password=True
+                    )
             else:
                 self._clear_remember()
-
 
             self.accept()
         else:
             self._show_msg("critical", "登录失败", "用户名或密码错误")
+
+    def handle_exit(self):
+        """处理退出系统按钮点击"""
+        msg_box = QtWidgets.QMessageBox()
+        msg_box.setWindowTitle("确认退出")
+        msg_box.setText("确定要退出FastGuard系统吗？")
+        msg_box.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        msg_box.setDefaultButton(QtWidgets.QMessageBox.No)
+    
+        # 设置样式，覆盖全局样式
+        msg_box.setStyleSheet("""
+            QMessageBox {
+                background-color: #ffffff;
+                color: #000000;
+                min-width: 800px;
+                min-height: 350px;
+            }
+            QMessageBox QLabel {
+                color: #000000;
+                font-size: 32px;
+                font-family: 'Microsoft YaHei';
+                qproperty-alignment: 'AlignCenter';
+                padding: 30px;
+            }
+            QPushButton {
+                background-color: #f0f0f0;
+                color: #000000;
+                border: 2px solid #cccccc;
+                border-radius: 10px;
+                padding: 20px 50px;
+                font-size: 40px;
+                font-weight: bold;
+                min-width: 200px;
+                min-height: 70px;
+            }
+            QPushButton:hover {
+                background-color: #e0e0e0;
+            }
+            QPushButton:pressed {
+                background-color: #d0d0d0;
+            }
+        """)
+    
+        reply = msg_box.exec_()
+    
+        if reply == QtWidgets.QMessageBox.Yes:
+            # 设置退出标志
+            self.exit_program = True
+            self.reject()  # 关闭登录窗口
 
     def handle_create(self):
         username = self.reg_input_user.text().strip()
