@@ -370,6 +370,41 @@ class LoginDialog(QtWidgets.QDialog):
         elif msg_type == "critical":
             msg.setIcon(QtWidgets.QMessageBox.Critical)
         msg.setWindowFlags(QtCore.Qt.Dialog | QtCore.Qt.WindowStaysOnTopHint)
+        
+        # 设置样式，确保文字清晰可见
+        msg.setStyleSheet("""
+            QMessageBox {
+                background-color: #ffffff;
+                color: #000000;
+                min-width: 800px;
+                min-height: 350px;
+            }
+            QMessageBox QLabel {
+                color: #000000;
+                font-size: 32px;
+                font-family: 'Microsoft YaHei';
+                qproperty-alignment: 'AlignCenter';
+                padding: 30px;
+            }
+            QPushButton {
+                background-color: #f0f0f0;
+                color: #000000;
+                border: 2px solid #cccccc;
+                border-radius: 10px;
+                padding: 20px 50px;
+                font-size: 40px;
+                font-weight: bold;
+                min-width: 200px;
+                min-height: 70px;
+            }
+            QPushButton:hover {
+                background-color: #e0e0e0;
+            }
+            QPushButton:pressed {
+                background-color: #d0d0d0;
+            }
+        """)
+        
         msg.exec_()
 
 
