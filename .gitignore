@@ -26,6 +26,7 @@ build/
 __pycache__/
 .venv/
 venv/
+myenv/
 
 # YOLO 训练记录与权重
 runs/

@@ -9,23 +9,112 @@ class AdminPanel(QtWidgets.QDialog):
         self.user_db = user_db
         self.log_db = log_db
         self.setWindowTitle("后台管理")
-        self.resize(900, 600)
+        self.resize(1600, 1000)
         self.setStyleSheet(
             """
-            QDialog { background-color: #09090b; color: #e5e7eb; font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; }
-            QLabel { color: #e5e7eb; }
-            QTabWidget::pane { border: 1px solid #27272a; border-radius: 4px; }
-            QTabBar::tab { background: #18181b; color: #a1a1aa; padding: 8px 16px; border: 1px solid #27272a; border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px; }
-            QTabBar::tab:selected { background: #27272a; color: #ffffff; border-color: #3f3f46; }
-            QHeaderView::section { background: #18181b; color: #e5e7eb; padding: 6px; border: 1px solid #27272a; font-weight: bold; }
-            QTableWidget { background: #111111; color: #e5e7eb; gridline-color: #27272a; border: 1px solid #27272a; }
-            QPushButton { background: #27272a; color: #ffffff; border: 1px solid #3f3f46; border-radius: 8px; padding: 6px 12px; }
-            QPushButton:hover { background: #3f3f46; border: 1px solid #6366f1; }
+            QDialog { 
+                background-color: #09090b; 
+                color: #e5e7eb; 
+                font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+                font-size: 24px;
+            }
+            QLabel { 
+                color: #e5e7eb; 
+                font-size: 32px;
+                font-weight: 600;
+            }
+            QTabWidget::pane { 
+                border: 2px solid #3f3f46; 
+                border-radius: 12px;
+                background: #111111;
+                padding: 20px;
+            }
+            QTabBar::tab { 
+                background: #18181b; 
+                color: #a1a1aa; 
+                padding: 30px 80px; 
+                border: 1px solid #27272a; 
+                border-bottom: none; 
+                border-top-left-radius: 12px; 
+                border-top-right-radius: 12px;
+                font-size: 36px;
+                font-weight: 600;
+                margin-right: 12px;
+                min-width: 250px;
+                max-width: 400px;
+            }
+            QTabBar::tab:selected { 
+                background: #27272a; 
+                color: #ffffff; 
+                border-color: #6366f1;
+                border-bottom: 2px solid #6366f1;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #27272a;
+                color: #ffffff;
+            }
+            QTabBar {
+                qproperty-drawBase: 0;
+            }
+            QHeaderView::section { 
+                background: #18181b; 
+                color: #e5e7eb; 
+                padding: 40px 30px; 
+                border: 1px solid #27272a; 
+                font-weight: bold;
+                font-size: 36px;
+                border-radius: 8px;
+                min-height: 120px;
+                height: 120px;
+            }
+            QTableWidget { 
+                background: #111111; 
+                color: #e5e7eb; 
+                gridline-color: #27272a; 
+                border: 2px solid #3f3f46; 
+                border-radius: 12px;
+                font-size: 36px;
+            }
+            QTableWidget::item {
+                padding: 30px;
+                height: 120px;
+            }
+            QTableWidget::item:selected {
+                background: #6366f1;
+                color: #ffffff;
+            }
+            QTableWidget::item:selected {
+                background: #6366f1;
+                color: #ffffff;
+            }
+            QTableWidget::item:selected {
+                background: #6366f1;
+                color: #ffffff;
+            }
+            QPushButton { 
+                background: #27272a; 
+                color: #ffffff; 
+                border: 2px solid #3f3f46; 
+                border-radius: 12px; 
+                padding: 15px 30px; 
+                font-size: 28px;
+                font-weight: 600;
+                min-width: 200px;
+                min-height: 70px;
+            }
+            QPushButton:hover { 
+                background: #3f3f46; 
+                border: 2px solid #6366f1;
+            }
+            QPushButton:pressed {
+                background: #18181b;
+            }
             """
         )
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setSpacing(32)
 
         tabs = QtWidgets.QTabWidget()
         layout.addWidget(tabs)
@@ -39,6 +128,8 @@ class AdminPanel(QtWidgets.QDialog):
         self.users_table.horizontalHeader().setStretchLastSection(True)
         self.users_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.users_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.users_table.verticalHeader().setDefaultSectionSize(90)
+        self.users_table.horizontalHeader().setFixedHeight(120)
         users_layout.addWidget(self.users_table)
 
         btn_row = QtWidgets.QHBoxLayout()
@@ -60,6 +151,8 @@ class AdminPanel(QtWidgets.QDialog):
         self.logs_table.horizontalHeader().setStretchLastSection(True)
         self.logs_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.logs_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.logs_table.verticalHeader().setDefaultSectionSize(90)
+        self.logs_table.horizontalHeader().setFixedHeight(120)
         logs_layout.addWidget(self.logs_table)
 
         log_btn_row = QtWidgets.QHBoxLayout()
@@ -95,9 +188,82 @@ class AdminPanel(QtWidgets.QDialog):
             return
         username = self.users_table.item(row, 0).text()
         if username == "admin":
-            QtWidgets.QMessageBox.warning(self, "提示", "管理员账号不可删除")
+            msg = QtWidgets.QMessageBox(self)
+            msg.setWindowTitle("提示")
+            msg.setText("管理员账号不可删除")
+            msg.setIcon(QtWidgets.QMessageBox.Warning)
+            msg.setStyleSheet("""
+                QMessageBox {
+                    background-color: #ffffff;
+                    color: #000000;
+                    min-width: 800px;
+                    min-height: 350px;
+                }
+                QMessageBox QLabel {
+                    color: #000000;
+                    font-size: 32px;
+                    font-family: 'Microsoft YaHei';
+                    qproperty-alignment: 'AlignCenter';
+                    padding: 30px;
+                }
+                QPushButton {
+                    background-color: #f0f0f0;
+                    color: #000000;
+                    border: 2px solid #cccccc;
+                    border-radius: 10px;
+                    padding: 20px 50px;
+                    font-size: 40px;
+                    font-weight: bold;
+                    min-width: 200px;
+                    min-height: 70px;
+                }
+                QPushButton:hover {
+                    background-color: #e0e0e0;
+                }
+                QPushButton:pressed {
+                    background-color: #d0d0d0;
+                }
+            """)
+            msg.exec_()
             return
-        if QtWidgets.QMessageBox.question(self, "确认", f"确认删除用户 {username} 吗？") != QtWidgets.QMessageBox.Yes:
+        msg = QtWidgets.QMessageBox(self)
+        msg.setWindowTitle("确认")
+        msg.setText(f"确认删除用户 {username} 吗？")
+        msg.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        msg.setDefaultButton(QtWidgets.QMessageBox.No)
+        msg.setStyleSheet("""
+            QMessageBox {
+                background-color: #ffffff;
+                color: #000000;
+                min-width: 800px;
+                min-height: 350px;
+            }
+            QMessageBox QLabel {
+                color: #000000;
+                font-size: 32px;
+                font-family: 'Microsoft YaHei';
+                qproperty-alignment: 'AlignCenter';
+                padding: 30px;
+            }
+            QPushButton {
+                background-color: #f0f0f0;
+                color: #000000;
+                border: 2px solid #cccccc;
+                border-radius: 10px;
+                padding: 20px 50px;
+                font-size: 40px;
+                font-weight: bold;
+                min-width: 200px;
+                min-height: 70px;
+            }
+            QPushButton:hover {
+                background-color: #e0e0e0;
+            }
+            QPushButton:pressed {
+                background-color: #d0d0d0;
+            }
+        """)
+        if msg.exec_() != QtWidgets.QMessageBox.Yes:
             return
         if self.user_db.delete_user(username):
             self.log_db.delete_logs_for_user(username)

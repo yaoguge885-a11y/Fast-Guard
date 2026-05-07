@@ -3,6 +3,13 @@
 # ==================================================================================
 import os
 import sys
+
+# --- 强制指定 Qt 插件路径，防止环境冲突导致找不到 qwindows.dll ---
+if "VIRTUAL_ENV" in os.environ or sys.prefix != sys.base_prefix:
+    qt_plugin_path = os.path.join(sys.prefix, "Lib", "site-packages", "PyQt5", "Qt5", "plugins")
+    os.environ["QT_PLUGIN_PATH"] = qt_plugin_path
+    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(qt_plugin_path, "platforms")
+
 import time
 import math
 import shutil
@@ -242,6 +249,16 @@ class VideoThread(QtCore.QThread):
         self.total_frames = 0
         self.duration = 0.0
         self._fps_ema = None
+
+        # ---- 统一帧步长常量（所有跳帧逻辑均以此为准） ----
+        self.FRAME_STRIDE: int = 2   # 每隔 N 帧执行一次 YOLO 推理
+
+        # ---- 调试面板开关（True 时在推理视图左下角叠加统一信息条） ----
+        self.debug_panel_enabled: bool = True
+
+        # ---- view_classifier 连续置信度缓存（每帧更新） ----
+        self._vc_fw_score: float = 0.5
+        self._vc_sw_score: float = 0.5
         
         # ---------- 中文字体路径设置 ----------
 
@@ -516,6 +533,43 @@ class VideoThread(QtCore.QThread):
 
         return bev_img
 
+    def _draw_debug_panel(self, frame, fw_score: float, sw_score: float,
+                          anchor: str, perspective: str, min_risk: int) -> object:
+        """
+        在推理视图左下角绘制统一的调试信息面板。
+
+        面板内容：视角 / 锚点 / 前向置信度 / 侧向置信度 / 当前报警级别
+        只在 debug_panel_enabled == True 时绘制，不影响业务逻辑。
+        """
+        if frame is None:
+            return frame
+        try:
+            h, w = frame.shape[:2]
+            lines = [
+                f"View : {perspective}",
+                f"Anchor: {anchor or 'N/A'}",
+                f"FW={fw_score:.2f}  SW={sw_score:.2f}",
+                f"Alarm : {'DANGER' if min_risk >= 2 else ('WARN' if min_risk == 1 else 'safe')}",
+            ]
+            line_h = 22
+            pad = 6
+            panel_w = 220
+            panel_h = len(lines) * line_h + pad * 2
+            x0, y0 = pad, h - panel_h - pad
+
+            # 半透明背景
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h), (20, 20, 20), -1)
+            cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+            alarm_color = (0, 0, 255) if min_risk >= 2 else ((0, 255, 255) if min_risk == 1 else (0, 200, 0))
+            for i, line in enumerate(lines):
+                c = alarm_color if i == 3 else (200, 200, 200)
+                cv2.putText(frame, line, (x0 + pad, y0 + pad + (i + 1) * line_h - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1, cv2.LINE_AA)
+        except Exception:
+            pass
+        return frame
 
     # --- 核心主循环 ---
     def run(self):
@@ -692,8 +746,11 @@ class VideoThread(QtCore.QThread):
                 preview_image = QtGui.QImage(
                     rgb_preview.data, pw, ph, bytes_per_line_preview, QtGui.QImage.Format_RGB888
                 )
-                # 拖拽时三画面同步显示原图
-                self.frame_signal.emit(preview_image.copy(), preview_image.copy(), preview_image.copy())
+                # 拖拽时四画面同步显示原图（BEV 用空白图占位）
+                bev_empty = np.zeros((400, 300, 3), dtype=np.uint8) + 20
+                bev_empty_rgb = cv2.cvtColor(bev_empty, cv2.COLOR_BGR2RGB)
+                qimg_bev_empty = QtGui.QImage(bev_empty_rgb.data, 300, 400, 300 * 3, QtGui.QImage.Format_RGB888)
+                self.frame_signal.emit(preview_image.copy(), preview_image.copy(), preview_image.copy(), qimg_bev_empty.copy())
                 self.position_signal.emit(
                     current_frame_idx,
                     self.total_frames,
@@ -728,8 +785,8 @@ class VideoThread(QtCore.QThread):
                 frame = self.side_alarm.draw_warning_lines(frame, h, w)
 
 
-            # 实跳帧逻辑：每 2 帧进行一次推理
-            if self._frame_count % 2 == 0:
+            # 统一跳帧逻辑：每 FRAME_STRIDE 帧进行一次推理
+            if self._frame_count % self.FRAME_STRIDE == 0:
                 results = model.track(
                     inference_frame,
                     persist=True,
@@ -835,35 +892,35 @@ class VideoThread(QtCore.QThread):
             global_vx = avg_dx * fps_value
             global_vy = avg_dy * fps_value
 
-            # 视角分析
-            current_time = time.time()
-            if not self.perspective_locked or current_time - self.last_perspective_time > 2.0:
-                self.view_classifier.analyze_frame(frame.copy(), infos)
-                
-                debug_info = self.view_classifier.get_debug_info()
-                if debug_info:
-                    self.last_debug_info = debug_info
-                    self.debug_signal.emit(debug_info)
-                
-                if debug_info.get('locked', False) and not self.perspective_locked:
-                    self.perspective_locked = True
-                    self.current_perspective = debug_info['locked_perspective']
-                    self.perspective_signal.emit(self.current_perspective)
-                    self.last_perspective_time = current_time
-                    
-                    if self.current_perspective == "侧面视角":
-                        self.status_signal.emit("侧向碰撞检测已启用")
-                        SYSTEM_LOGGER.info("切换到侧向视角，使用侧向碰撞检测器")
-                    elif self.current_perspective == "前向视角":
-                        self.status_signal.emit("前向碰撞检测已启用")
-                        SYSTEM_LOGGER.info("切换到前向视角，使用前向碰撞检测器")
-                
-                elif not self.perspective_locked:
-                    perspective = self.view_classifier.determine_perspective()
-                    if perspective != "分析中..." and perspective != self.current_perspective:
-                        self.current_perspective = perspective
-                        self.perspective_signal.emit(perspective)
-                        self.last_perspective_time = current_time
+            # ---- 视角分析：每帧必须执行，分类器内部 check_interval 控制计算频率 ----
+            # 捕获连续置信度得分（用于调试面板和子模块传播）
+            self._vc_fw_score, self._vc_sw_score = self.view_classifier.analyze_frame(
+                frame.copy(), infos
+            )
+
+            vc_debug_info = self.view_classifier.get_debug_info()
+            if vc_debug_info:
+                self.last_debug_info = vc_debug_info
+                self.debug_signal.emit(vc_debug_info)
+
+            # 更新视角状态（由分类器置信度驱动，移除外部时间限流）
+            new_perspective = self.view_classifier.determine_perspective()
+            if new_perspective != "分析中..." and new_perspective != self.current_perspective:
+                self.current_perspective = new_perspective
+                self.perspective_signal.emit(new_perspective)
+                self.last_perspective_time = time.time()
+                if self.current_perspective == "侧面视角":
+                    self.status_signal.emit("侧向碰撞检测已启用")
+                    SYSTEM_LOGGER.info("切换到侧向视角，使用侧向碰撞检测器")
+                elif self.current_perspective == "前向视角":
+                    self.status_signal.emit("前向碰撞检测已启用")
+                    SYSTEM_LOGGER.info("切换到前向视角，使用前向碰撞检测器")
+
+            # ---- 将视角状态与锚点传播给子模块 ----
+            self.side_alarm.set_perspective(self.current_perspective)
+            _anchor = vc_debug_info.get('side_anchor') if vc_debug_info else None
+            if self.side_detector:
+                self.side_detector.set_anchor_side(_anchor)
 
             # 可视化调试：在检测到静止锚点时画红色实心方块（内存优化）
             left_static = getattr(self.view_classifier, 'left_static', False)
@@ -1091,6 +1148,9 @@ class VideoThread(QtCore.QThread):
                             self._update_world_track(track_id, world_pos)
                             intent, yaw_deg, angle_cost = self._predict_intent(track_id, world_pos)
                     
+                    # 按类别设置面积阈值：行人/非机动车目标较小，降低阈值提升召回
+                    _min_ar = 0.005 if class_name in {"person", "bicycle", "motorcycle"} else 0.015
+
                     # 使用正面碰撞检测器
                     ttc, vx, vy, dw_dt, red_allowed, vw, is_static, risk_level, in_path = self.front_detector.update(
                         track_id,
@@ -1104,6 +1164,7 @@ class VideoThread(QtCore.QThread):
                         area_ratio,
                         global_vx,
                         global_vy,
+                        min_area_ratio=_min_ar,
                         use_ema=class_name in {"person", "bicycle", "motorcycle"},
                         distance=obj_dist,
                         v_self_mps=self.v_self_mps,
@@ -1172,7 +1233,7 @@ class VideoThread(QtCore.QThread):
 
                 ratio = vx_abs / max(vw, 1e-3)
                 center_relaxed = (w * 0.35) <= cx <= (w * 0.65)
-                ratio_threshold = 0.9 if center_relaxed else 0.9
+                ratio_threshold = 0.9 if center_relaxed else 1.2
 
                 lateral_fast = ratio > ratio_threshold
                 red_ok = red_allowed and not lateral_fast
@@ -1195,6 +1256,12 @@ class VideoThread(QtCore.QThread):
                     min_ttc = warn_ttc
                     min_id = track_id
 
+                # 去抖动：连续帧确认后才真正输出报警颜色
+                if self.current_perspective == "前向视角":
+                    risk_level = self.front_alarm.check_debounce(track_id, risk_level)
+                else:
+                    risk_level = self.side_alarm.check_debounce(track_id, risk_level)
+
                 # 根据视角获取显示参数
                 if self.current_perspective == "前向视角":
                     color, label, thickness = self.front_alarm.get_display_params(
@@ -1213,30 +1280,49 @@ class VideoThread(QtCore.QThread):
                     if risk_level >= 2:
                         color = (0, 0, 255)
                         thickness = max(thickness, 3)
-                    label = f"{label_disp} {debug_info}" if debug_info else label_disp
+                    label = f"{label_disp} {debug_info}" if isinstance(debug_info, str) and debug_info else label_disp
                 # 根据视角绘制L型角框
                 if self.current_perspective == "前向视角":
                     frame = self.front_alarm.draw_l_corners(frame, x1, y1, x2, y2, color, thickness=thickness, seg=18)
                     deferred_draws.append((label, (x1, y1 - 35), 24, color))
                 else:
                     frame = self.side_alarm.draw_l_corners(frame, x1, y1, x2, y2, color, thickness=thickness, seg=18)
-                    # 侧面视角：使用强制设置的标签
-                deferred_draws.append((label, (x1, y1 - 35), 24, color))
+                    deferred_draws.append((label, (x1, y1 - 35), 24, color))
                 
                 # 收集 BEV 数据
                 if world_pos is not None:
                     bev_data.append((world_pos, class_name, risk_level))
 
-            # 问题9修复：前向/侧向使用独立的 TTC 报警阈值
+            # ---- 定期清理陈旧轨迹和无界字典（每60帧一次） ----
+            if self._frame_count % 60 == 0:
+                if self.front_detector:
+                    self.front_detector.cleanup_stale_tracks(max_age=90)
+                if self.side_detector:
+                    self.side_detector.cleanup_stale_targets(max_inactive_frames=90)
+                # 清理 VideoThread 级别的无界字典
+                current_ids = {rec[0] for rec in infos}
+                for d in (self._last_centers, self._seen_counts, self._last_distance, self._vrel_history):
+                    stale_keys = [k for k in d if k not in current_ids]
+                    for k in stale_keys:
+                        del d[k]
+                # 清理报警模块去抖计数器
+                if self.front_alarm:
+                    self.front_alarm.cleanup_debounce(max_age=60)
+                if self.side_alarm:
+                    self.side_alarm.cleanup_debounce(max_age=60)
+
+            # ---- 前向/侧向使用独立的 TTC 报警阈值 ----
             alarm_threshold = 2.0 if self.current_perspective == "侧面视角" else 2.5
+            # 取当前视角下最高风险等级用于调试面板显示
+            _panel_risk = 2 if min_ttc < alarm_threshold else (1 if min_ttc < alarm_threshold + 1.0 else 0)
             if min_ttc < alarm_threshold:
-                if self._frame_count % 2 == 0:
+                if self._frame_count % self.FRAME_STRIDE == 0:
                     cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 8)
                 self.log_signal.emit(min_id, min_ttc)
                 self.audio_alarm.trigger()
             else:
                 self.audio_alarm.cease()
-            
+
             self.ttc_signal.emit(min_ttc, min_id)
 
             # === 侧壁渲染逻辑 ===
@@ -1256,6 +1342,17 @@ class VideoThread(QtCore.QThread):
             if deferred_draws:
                 frame = self._draw_batch_chinese(frame, deferred_draws)
                 deferred_draws = []
+
+            # 6. 统一调试面板（叠加在推理视图左下角）
+            if self.debug_panel_enabled:
+                frame = self._draw_debug_panel(
+                    frame,
+                    fw_score=self._vc_fw_score,
+                    sw_score=self._vc_sw_score,
+                    anchor=_anchor,
+                    perspective=self.current_perspective,
+                    min_risk=_panel_risk,
+                )
 
             # 1. Original View
             rgb_orig = cv2.cvtColor(frame_raw, cv2.COLOR_BGR2RGB)
@@ -1298,7 +1395,11 @@ class VideoThread(QtCore.QThread):
                 self._fps_ema = 0.9 * self._fps_ema + 0.1 * fps_live
             self.latency_signal.emit(elapsed * 1000.0)
 
-
+            # 控制视频播放帧率，防止读取视频过快导致 UI 卡顿和 OOM 闪退
+            expected_time = 1.0 / fps_value if fps_value else 0.033
+            sleep_time = expected_time - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
         if self.cap:
             self.cap.release()
@@ -1362,7 +1463,7 @@ class SplashScreen(QtWidgets.QWidget):
         self.bg_frame.setObjectName("splashBg")
         self.bg_frame.setStyleSheet("""
             QFrame#splashBg {
-                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #09090b, stop:0.5 #18181b, stop:1 #27272a);
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #000000, stop:0.3 #09090b, stop:0.7 #18181b, stop:1 #27272a);
                 border-radius: 24px;
                 border: 2px solid #3f3f46;
             }
@@ -1373,7 +1474,7 @@ class SplashScreen(QtWidgets.QWidget):
 
         # Icon / Logo Placeholder (Modern style)
         logo_layout = QtWidgets.QHBoxLayout()
-        logo_label = QtWidgets.QLabel("❖")
+        logo_label = QtWidgets.QLabel("🛡️")
         logo_label.setStyleSheet("font-size: 80px; background: transparent; color: #6366f1;")
         logo_layout.addStretch()
         logo_layout.addWidget(logo_label)
@@ -1393,7 +1494,7 @@ class SplashScreen(QtWidgets.QWidget):
         
         self.subtitle_label = QtWidgets.QLabel("智能防碰撞预警引擎")
         self.subtitle_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.subtitle_label.setStyleSheet("color: #6366f1; font-size: 24px; letter-spacing: 8px; font-weight: 700; background: transparent; margin-top: 10px;")
+        self.subtitle_label.setStyleSheet("color: #ffffff; font-size: 24px; letter-spacing: 8px; font-weight: 700; background: transparent; margin-top: 10px;")
 
         # Progress Section
         progress_container = QtWidgets.QWidget()
@@ -1407,12 +1508,12 @@ class SplashScreen(QtWidgets.QWidget):
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setStyleSheet("""
             QProgressBar {
-                background: #18181b;
-                border: 1px solid #27272a;
+                background: rgba(255, 255, 255, 0.2);
+                border: 1px solid rgba(255, 255, 255, 0.3);
                 border-radius: 6px;
             }
             QProgressBar::chunk {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #4f46e5, stop:1 #6366f1);
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #7c3aed, stop:0.5 #8b5cf6, stop:1 #a78bfa);
                 border-radius: 6px;
             }
         """)
@@ -1774,7 +1875,7 @@ class MainWindow(QtWidgets.QWidget):
         # === Left Sidebar ===
         self.sidebar = QtWidgets.QFrame()
         self.sidebar.setObjectName("sidebar")
-        self.sidebar.setFixedWidth(370)  # Adjusted width for larger Chinese text and larger fonts
+        self.sidebar.setFixedWidth(400)  # Increased width to ensure FASTGUARD text is fully visible
         
         sidebar_layout = QtWidgets.QVBoxLayout(self.sidebar)
         sidebar_layout.setContentsMargins(24, 40, 24, 40)
@@ -1782,9 +1883,9 @@ class MainWindow(QtWidgets.QWidget):
 
         # Logo / Title Area
         app_logo_layout = QtWidgets.QHBoxLayout()
-        # Use a geometric shape for a more sci-fi look
-        logo_icon = QtWidgets.QLabel("❖") 
-        logo_icon.setStyleSheet("font-size: 48px; color: #6366f1; background: transparent;")
+        # Use shield icon for security theme
+        logo_icon = QtWidgets.QLabel("🛡️") 
+        logo_icon.setStyleSheet("font-size: 48px; color: #1e40af; background: transparent;")
         logo_text = QtWidgets.QLabel("FASTGUARD")
         logo_text.setStyleSheet("""
             font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
@@ -1985,8 +2086,8 @@ class MainWindow(QtWidgets.QWidget):
             lbl_title.setStyleSheet("color: #e4e4e7; font-weight: 600; font-size: 24px; border: none; background: transparent; font-family: 'Microsoft YaHei';")
             
             # Live Indicator
-            lbl_live = QtWidgets.QLabel("● 实时")
-            lbl_live.setStyleSheet("color: #ef4444; font-weight: 700; font-size: 21px; border: none; background: transparent; letter-spacing: 1px; font-family: 'Microsoft YaHei';")
+            lbl_live = QtWidgets.QLabel("🛡️ 实时")
+            lbl_live.setStyleSheet("color: #ffffff; font-weight: 700; font-size: 21px; border: none; background: transparent; letter-spacing: 1px; font-family: 'Microsoft YaHei';")
             
             vh_layout.addWidget(lbl_title)
             vh_layout.addStretch()
@@ -2080,8 +2181,8 @@ class MainWindow(QtWidgets.QWidget):
 
         # Time Display
         time_container = QtWidgets.QHBoxLayout()
-        icon_time = QtWidgets.QLabel("⏱")
-        icon_time.setStyleSheet("color: #71717a; font-size: 30px; border: none; background: transparent;")
+        icon_time = QtWidgets.QLabel("🛡️")
+        icon_time.setStyleSheet("color: #1e40af; font-size: 30px; border: none; background: transparent;")
         
         self.time_label = QtWidgets.QLabel("00:00 / 00:00")
         self.time_label.setAlignment(QtCore.Qt.AlignRight)
@@ -2913,14 +3014,24 @@ def main():
         if username is None:
             return False
         
-        main_window = MainWindow(user_db, log_db, username, role)
-        main_window.show()
+        # 显示启动画面
+        splash = SplashScreen()
+        splash.show()
         
-        # 运行事件循环，直到主窗口关闭
+        # 等待启动画面完成
+        splash.finished.connect(lambda: start_main_window(username, role))
+        
+        # 运行事件循环，等待启动画面完成
         app.exec_()
         
         # 检查是否需要重新登录
         return getattr(main_window, 'need_relogin', False)
+    
+    def start_main_window(username, role):
+        """启动画面完成后显示主窗口"""
+        global main_window
+        main_window = MainWindow(user_db, log_db, username, role)
+        main_window.show()
     
     # 主循环：登录 → 主窗口 → 重新登录/退出
     while True:

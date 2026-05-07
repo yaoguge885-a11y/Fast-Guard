@@ -12,9 +12,9 @@ class LoginDialog(QtWidgets.QDialog):
         self.setStyleSheet(
             """
             QFrame#dialogBg {
-                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #09090b, stop:0.5 #18181b, stop:1 #27272a);
+                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #0c0a09, stop:0.5 #1c1917, stop:1 #292524);
                 border-radius: 24px;
-                border: 2px solid #3f3f46;
+                border: 2px solid #44403c;
             }
             QLabel {
                 color: #ffffff;
@@ -148,8 +148,8 @@ class LoginDialog(QtWidgets.QDialog):
         layout.setSpacing(16)
 
         # Logo and Title
-        logo_label = QtWidgets.QLabel("❖")
-        logo_label.setStyleSheet("font-size: 120px; color: #6366f1; margin-bottom: 0px;")
+        logo_label = QtWidgets.QLabel("🛡️")
+        logo_label.setStyleSheet("font-size: 120px; color: #1e40af; margin-bottom: 0px;")
         logo_label.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(logo_label)
 
@@ -222,8 +222,8 @@ class LoginDialog(QtWidgets.QDialog):
         layout.setSpacing(14)
 
         # Logo and Title
-        logo_label = QtWidgets.QLabel("✧")
-        logo_label.setStyleSheet("font-size: 120px; color: #10b981; margin-bottom: 0px;")
+        logo_label = QtWidgets.QLabel("🛡️")
+        logo_label.setStyleSheet("font-size: 120px; color: #1e40af; margin-bottom: 0px;")
         logo_label.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(logo_label)
 

@@ -99,6 +99,15 @@ class SideDetectorConfig:
     monitor_y_min_close: float = -5.0      # 贴身车辆的Y轴监控范围（更宽松）
     monitor_y_max_close: float = 10.0
 
+    # 风险判定距离阈值（可配置，替代原硬编码常量）
+    risk_critical_distance: float = 0.8    # 极近区阈值（米），低于此距离无条件红警
+    risk_near_distance: float = 2.0        # 近区阈值（米）
+    risk_mid_distance: float = 4.0         # 中区阈值（米）
+    fast_retreat_threshold: float = -1.0   # 快速后撤纵向速度阈值（m/s）
+    anchor_zone_expansion: float = 1.2     # 锚点侧检测范围扩展倍数
+    vy_dead_zone: float = 0.5             # 纵向速度死区（m/s），低于此值忽略纵向判断
+    velocity_clamp: float = 10.0           # 速度回归输出最大绝对值（m/s）
+
 
 class SideCollisionDetector:
     """
@@ -157,7 +166,23 @@ class SideCollisionDetector:
         # 车体偏移补偿
         self._body_offset = self.config.body_offset
 
+        # 锚点联动（由 ViewClassifier 实时更新，None 表示未确定）
+        self._anchor_side: Optional[str] = None
+
+        # 轨迹生命周期管理（基于帧计数器，修复原 cleanup_stale_targets 逻辑错误）
+        self._frame_counter: int = 0
+        self._last_seen: Dict[int, int] = {}
+
     
+    def set_anchor_side(self, anchor: Optional[str]) -> None:
+        """
+        联动 ViewClassifier 的侧向锚点，动态调整优先检测区域。
+
+        Args:
+            anchor: "left"、"right" 或 None
+        """
+        self._anchor_side = anchor
+
     def update(
         self,
         track_id: int,
@@ -179,13 +204,17 @@ class SideCollisionDetector:
         """
         if world_pos is None:
             return None
-        
+
+        # 轨迹生命周期：记录当前帧编号
+        self._frame_counter += 1
+        self._last_seen[track_id] = self._frame_counter
+
         x, y = world_pos
         cfg = self.config
-        
+
         # 记录类别
         self._class_names[track_id] = class_name
-        
+
         # 更新出现帧数
         self._seen_frames[track_id] = self._seen_frames.get(track_id, 0) + 1
         
@@ -390,6 +419,11 @@ class SideCollisionDetector:
             vx = (x_curr - x_prev) / dt
             vy = (y_curr - y_prev) / dt
 
+        # 钳制速度输出，防止小样本回归噪声放大
+        clamp = self.config.velocity_clamp
+        vx = max(-clamp, min(clamp, vx))
+        vy = max(-clamp, min(clamp, vy))
+
         return vx, vy
     
     def _is_in_monitor_zone(self, x: float, y: float, distance_x: float = None) -> bool:
@@ -405,7 +439,7 @@ class SideCollisionDetector:
             是否在监控区域
         """
         cfg = self.config
-        
+
         # 对于贴身车辆（distance_x < immediate_alarm_distance），使用更宽松的Y轴范围
         if distance_x is not None and distance_x < cfg.immediate_alarm_distance:
             y_min = cfg.monitor_y_min_close
@@ -413,15 +447,22 @@ class SideCollisionDetector:
         else:
             y_min = cfg.monitor_y_min
             y_max = cfg.monitor_y_max
-        
+
         # 检查纵向范围
         if not (y_min <= y <= y_max):
             return False
-        
-        # 检查横向范围
-        if abs(x) > cfg.monitor_x_max:
+
+        # 盲区补偿：锚点侧横向检测范围扩展（加强对本车侧的感知）
+        if self._anchor_side == "left" and x < 0:
+            x_max = cfg.monitor_x_max * cfg.anchor_zone_expansion
+        elif self._anchor_side == "right" and x > 0:
+            x_max = cfg.monitor_x_max * cfg.anchor_zone_expansion
+        else:
+            x_max = cfg.monitor_x_max
+
+        if abs(x) > x_max:
             return False
-        
+
         return True
     
     def _is_static(self, track_id: int) -> bool:
@@ -478,12 +519,14 @@ class SideCollisionDetector:
         if len(vy_hist) > 0:
             vy_ema = vy_hist[-1]  # 使用最新速度
 
-        # 对于后方目标（y < 0），需要它正在向前行驶（vy > 0）才算在靠近
-        if y_raw < 0 and vy_ema < 0:
+        # 纵向速度死区：当 |vy| 很小时忽略纵向方向判断（避免噪声干扰）
+        dz = self.config.vy_dead_zone
+        # 对于后方目标（y < 0），需要它正在向前行驶（vy > dz）才算在靠近
+        if y_raw < 0 and vy_ema < -dz:
             return False
 
-        # 对于前方目标（y > 0），需要它正在向后行驶（vy < 0）才算在靠近
-        if y_raw > 0 and vy_ema > 0:
+        # 对于前方目标（y > 0），需要它正在向后行驶（vy < -dz）才算在靠近
+        if y_raw > 0 and vy_ema > dz:
             return False
 
         # 计算横向靠近速度（正值表示靠近）
@@ -521,9 +564,9 @@ class SideCollisionDetector:
         Returns:
             TTL（秒）
         """
-        if not is_approaching or abs(vx) < self.config.min_approach_speed:
+        if not is_approaching or abs(vx) < max(self.config.min_approach_speed, 1e-3):
             return 99.0
-        
+
         # TTL = 距离 / 靠近速度
         ttl = distance_x / abs(vx)
         return max(0.0, ttl)
@@ -541,35 +584,35 @@ class SideCollisionDetector:
         """
         问题4与问题7修复：基于距离×靠近速度组合判定，并过滤超车场景误报
         """
+        cfg = self.config
         # 静止目标全面过滤
         if is_static:
             return 0
 
-        # ========== 极近区（X < 0.8m）：无条件红警，已物理越线 ==========
-        if distance_x < 0.8:
+        # ========== 极近区（X < risk_critical_distance）：无条件红警，已物理越线 ==========
+        if distance_x < cfg.risk_critical_distance:
             return 2
 
-        # ========== 近区（0.8m ≤ X < 2.0m）：需要有明确的靠近趋势才报警 ==========
-        if distance_x < 2.0:
-            # 问题7：超车场景过滤 — 目标在快速向后掉队（我方超过其前）
-            if vy < -1.0 and not is_approaching:
+        # ========== 近区（risk_critical ≤ X < risk_near）：需要有明确的靠近趋势才报警 ==========
+        if distance_x < cfg.risk_near_distance:
+            # 超车场景过滤 — 目标在快速向后掉队
+            if vy < cfg.fast_retreat_threshold and not is_approaching:
                 return 0
             # 有明确的横向靠近趋势才控车
-            if is_approaching and approach_speed > 0.2:
-                return 2 if ttl < 2.0 else 1
+            if is_approaching and approach_speed > cfg.min_approach_speed:
+                return 2 if ttl < cfg.ttl_warning_threshold else 1
             # 在极近区但未明显靠近，保守性黄色预警
             return 1
 
-        # ========== 中区（2.0m ≤ X < 4.0m）：有靠近趋势才黄警 ==========
-        if distance_x < 4.0:
-            if vy < -1.0 and not is_approaching:
+        # ========== 中区（risk_near ≤ X < risk_mid）：有靠近趋势才黄警 ==========
+        if distance_x < cfg.risk_mid_distance:
+            if vy < cfg.fast_retreat_threshold and not is_approaching:
                 return 0
-            if is_approaching and approach_speed > 0.4:
+            if is_approaching and approach_speed > cfg.min_approach_speed * 2:
                 return 1
             return 0
 
-
-        # ========== 安全区（X ≥ 4.0m）==========
+        # ========== 安全区（X ≥ risk_mid_distance）==========
         return 0
     
     def _generate_warning(
@@ -677,6 +720,7 @@ class SideCollisionDetector:
         self._seen_frames.pop(track_id, None)
         self._static_targets.discard(track_id)
         self._alarm_counters.pop(track_id, None)
+        self._last_seen.pop(track_id, None)
     
     def clear_all(self):
         """清空所有目标数据"""
@@ -693,16 +737,25 @@ class SideCollisionDetector:
         self._seen_frames.clear()
         self._static_targets.clear()
         self._alarm_counters.clear()
+        self._last_seen.clear()
     
-    def cleanup_stale_targets(self, max_inactive_frames: int = 30):
+    def cleanup_stale_targets(self, max_inactive_frames: int = 30) -> List[int]:
         """
-        清理长时间未更新的目标
-        
+        清理超过 max_inactive_frames 帧未更新的轨迹，防止 ID 积累和内存泄漏。
+
+        修复：原实现使用 _seen_frames（累计观测计数）判断活跃度，会误删新目标。
+        现改用 _frame_counter / _last_seen 时间戳对比，与 front_detector 一致。
+
         Args:
-            max_inactive_frames: 最大不活跃帧数
+            max_inactive_frames: 允许最大未更新帧数
+
+        Returns:
+            已清理的 track_id 列表
         """
-        active_ids = set(self._seen_frames.keys())
-        for track_id in list(active_ids):
-            if self._seen_frames[track_id] < max_inactive_frames:
-                continue
-            self.remove_target(track_id)
+        stale = [
+            tid for tid, last in self._last_seen.items()
+            if self._frame_counter - last > max_inactive_frames
+        ]
+        for tid in stale:
+            self.remove_target(tid)
+        return stale

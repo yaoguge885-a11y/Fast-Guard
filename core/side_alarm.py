@@ -5,20 +5,25 @@
 1. 侧面视角警示线绘制（红线 + 黄线）
 2. 0.8m 物理壁垒 (Side Wall) 绘制 — 颜色随距离动态变化
 3. L型角框绘制
+4. 去抖动报警 + 视角联动静默
 """
 
 import cv2
 import numpy as np
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
 
 
 class SideAlarm:
     """侧面报警类"""
 
-    def __init__(self, camera_side="left"):
+    def __init__(self, camera_side: str = "left", confirm_frames: int = 2,
+                 approach_speed_threshold: float = 2.0, safe_distance: float = 2.0):
         """
         Args:
             camera_side: 相机位置，"left" 或 "right"
+            confirm_frames: 连续满足触发条件的帧数才输出报警（去抖动）
+            approach_speed_threshold: 侧向靠近速度报警阈值（m/s）
+            safe_distance: 安全距离阈值（米），用于壁垒颜色和标签判定
         """
         self.camera_side = camera_side
         self.warning_line_x = None
@@ -29,9 +34,68 @@ class SideAlarm:
         self.wall_pixel_x = None          # 壁垒在画面中的 X 像素位置（由 IPM 计算）
         self.wall_pixel_x_fallback = None # 无 IPM 时的后备位置
 
+        # 可配置报警参数
+        self.approach_speed_threshold = approach_speed_threshold
+        self.safe_distance = safe_distance
+
         # ---- 壁垒颜色状态 ----
         self.closest_object_distance = 99.0   # 最近目标到车身的距离（米），每帧更新
         self._flash_counter = 0               # 闪烁计数器
+
+        # ---- 视角联动 ----
+        self._current_perspective: str = "分析中..."  # 由主程序调用 set_perspective() 更新
+
+        # ---- 去抖动 ----
+        self._confirm_frames: int = max(1, confirm_frames)
+        self._alarm_counters: Dict[int, int] = {}
+        self._debounce_frame_counter: int = 0
+        self._debounce_last_seen: Dict[int, int] = {}
+
+    def set_perspective(self, perspective: str) -> None:
+        """
+        接收 ViewClassifier 的当前视角状态。
+        当视角为前向时，get_display_params 将降低灵敏度。
+
+        Args:
+            perspective: "前向视角" / "侧面视角" / "分析中..."
+        """
+        self._current_perspective = perspective
+
+    def check_debounce(self, track_id: int, raw_risk: int) -> int:
+        """
+        去抖动：连续 confirm_frames 帧满足触发条件才真正输出报警。
+
+        Args:
+            track_id: 跟踪 ID
+            raw_risk: 当前帧原始风险等级（0/1/2）
+
+        Returns:
+            去抖后的风险等级
+        """
+        self._debounce_frame_counter += 1
+        self._debounce_last_seen[track_id] = self._debounce_frame_counter
+        if raw_risk >= 2:
+            self._alarm_counters[track_id] = self._confirm_frames
+            return raw_risk
+        if raw_risk > 0:
+            cnt = self._alarm_counters.get(track_id, 0) + 1
+            self._alarm_counters[track_id] = cnt
+            return raw_risk if cnt >= self._confirm_frames else 0
+        self._alarm_counters.pop(track_id, None)
+        return 0
+
+    def clear_debounce(self, track_id: int) -> None:
+        """显式清除某目标的去抖计数（目标消失时调用）"""
+        self._alarm_counters.pop(track_id, None)
+        self._debounce_last_seen.pop(track_id, None)
+
+    def cleanup_debounce(self, max_age: int = 60) -> None:
+        """清理超过 max_age 帧未活跃的去抖计数器，防止内存泄漏"""
+        stale = [tid for tid, last in self._debounce_last_seen.items()
+                 if self._debounce_frame_counter - last > max_age]
+        for tid in stale:
+            self._alarm_counters.pop(tid, None)
+            self._debounce_last_seen.pop(tid, None)
 
     def set_wall_distance(self, distance: float):
         """设置物理壁垒距离（用户可调）"""
@@ -148,7 +212,7 @@ class SideAlarm:
                 wall_color = (0, 0, 180)      # 暗红
                 alpha_val = 0.2
             line_thickness = 4
-        elif dist < 2.0:
+        elif dist < self.safe_distance:
             # 注意区域
             wall_color = (0, 255, 255)        # 黄色
             alpha_val = 0.15
@@ -159,14 +223,16 @@ class SideAlarm:
             alpha_val = 0.08
             line_thickness = 2
 
-        # ---------- 绘制半透明带 ----------
+        # ---------- 绘制半透明带（ROI 优化：仅拷贝窄条区域而非整帧） ----------
         band_half_w = 12  # 半透明带宽度（像素）
         x_left = max(0, wall_x - band_half_w)
         x_right = min(w, wall_x + band_half_w)
 
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (x_left, 0), (x_right, h), wall_color, -1)
-        cv2.addWeighted(overlay, alpha_val, frame, 1.0 - alpha_val, 0, frame)
+        if x_right > x_left:
+            roi = frame[0:h, x_left:x_right].copy()
+            color_band = np.full_like(roi, wall_color, dtype=np.uint8)
+            cv2.addWeighted(color_band, alpha_val, roi, 1.0 - alpha_val, 0, roi)
+            frame[0:h, x_left:x_right] = roi
 
         # ---------- 绘制中心实线 ----------
         cv2.line(frame, (wall_x, 0), (wall_x, h), wall_color, line_thickness)
@@ -181,7 +247,7 @@ class SideAlarm:
         label = f"{self.wall_distance:.1f}m"
         if dist < self.wall_distance:
             label = f"!! {self.wall_distance:.1f}m !!"
-        elif dist < 2.0:
+        elif dist < self.safe_distance:
             label = f"! {self.wall_distance:.1f}m"
 
         # 标签位置：壁垒线上方
@@ -212,28 +278,38 @@ class SideAlarm:
 
     def get_display_params(self, track_id, class_name, ttc, x1, x2, vx,
                            warning_line_x, yellow_line_x):
-        """获取显示参数（中文）"""
+        """
+        获取显示参数（中文）。
+
+        改进：
+        - 以目标框横向速度 vx（m/s，来自 side_detector 世界坐标）为主要危险判据，
+          阈值从原 30.0（≈108 km/h，几乎不触发）改为 2.0 m/s（≈7.2 km/h）。
+        - 当视角为前向时（set_perspective 已更新），降低灵敏度：仅显示绿色安全标签。
+        """
         class_map = {
             "person": "行人", "bicycle": "自行车", "car": "轿车",
             "motorcycle": "摩托车", "truck": "卡车", "bus": "公交车"
         }
         chinese_class = class_map.get(class_name, class_name)
+        id_suffix = f" {track_id}" if track_id >= 0 else ""
         current_side = self.camera_side
 
-        in_red_zone = False
-        if current_side == "left":
-            in_red_zone = x2 <= warning_line_x
-        else:
-            in_red_zone = x1 >= warning_line_x
+        # ---- 前向视角时静默：侧向报警降低灵敏度 ----
+        if self._current_perspective == "前向视角":
+            return (0, 200, 0), f"{chinese_class}{id_suffix}", 1
 
-        approach_speed = float(vx)
+        in_red_zone = (x2 <= warning_line_x) if current_side == "left" else (x1 >= warning_line_x)
+
+        # 横向靠近速度（m/s）：正值表示向本车靠近
+        lateral_speed = float(vx)
         if current_side == "right":
-            approach_speed = -approach_speed
-        approach_fast = approach_speed >= 30.0
+            lateral_speed = -lateral_speed  # 右侧摄像头：vx 符号反转
+        # 主要危险判据：横向靠近速度 >= 阈值（可配置，默认 2.0 m/s）
+        approach_fast = lateral_speed >= self.approach_speed_threshold
 
         if in_red_zone and approach_fast:
             color = (0, 0, 255)
-            label = f"危险！{chinese_class} 进入报警区域"
+            label = f"危险！{chinese_class} vx={lateral_speed:.1f}m/s"
             thickness = 3
         elif in_red_zone:
             color = (0, 255, 255)
@@ -241,7 +317,7 @@ class SideAlarm:
             thickness = 2
         else:
             color = (0, 255, 0)
-            label = f"{chinese_class} {track_id}" if track_id >= 0 else chinese_class
+            label = f"{chinese_class}{id_suffix}"
             thickness = 2
 
         return color, label, thickness

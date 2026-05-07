@@ -19,8 +19,20 @@ import collections
 class ViewClassifier:
     """视角分类器：具备连续反馈和多维时延感知的判决状态机"""
 
-    def __init__(self, log_dir: str = None):
+    def __init__(self, log_dir: str = None,
+                 edge_flow_weight: float = 1.2, center_flow_weight: float = 0.6,
+                 side_evidence_base: float = 0.4, flow_side_factor: float = 0.6,
+                 flow_front_factor: float = 0.7, min_dwell_frames: int = 3,
+                 max_tracked_ids: int = 200):
         self.log_dir = log_dir
+        # 可配置的光流打分权重
+        self.edge_flow_weight = edge_flow_weight
+        self.center_flow_weight = center_flow_weight
+        self.side_evidence_base = side_evidence_base
+        self.flow_side_factor = flow_side_factor
+        self.flow_front_factor = flow_front_factor
+        self.min_dwell_frames = min_dwell_frames
+        self.max_tracked_ids = max_tracked_ids
         self.reset()
         self.setup_logger()
 
@@ -75,9 +87,9 @@ class ViewClassifier:
         self.center_mse = 0.0
 
         # ---- 新增优化：队列与连续得分 (问题2, 5) ----
-        self.left_mse_history = collections.deque(maxlen=3)
-        self.right_mse_history = collections.deque(maxlen=3)
-        self.global_mse_history = collections.deque(maxlen=5)
+        self.left_mse_history = collections.deque(maxlen=5)   # 窗口5：抑制相机抖动
+        self.right_mse_history = collections.deque(maxlen=5)  # 窗口5：抑制相机抖动
+        self.global_mse_history = collections.deque(maxlen=30)  # 扩大历史窗口供百分位计算
 
         self.history_centers = {}
         
@@ -86,7 +98,15 @@ class ViewClassifier:
         self.current_forward_score = 0.5
         self.current_side_score = 0.5
         
+        # 拆分为独立的侧面确认计数 / 前向回退计数（替代原 side_lock_counter 双义变量）
+        self._side_confirm_count = 0
+        self._front_return_count = 0
+        # 向后兼容：get_debug_info 仍读取 side_lock_counter
         self.side_lock_counter = 0
+
+        # 最小驻留帧数：切换视角后至少停留 N 帧，抑制高频跳变
+        self._dwell_counter = 0
+        self._last_view = "分析中..."
 
         self.target_width = 160
         self.target_height = 120
@@ -112,12 +132,12 @@ class ViewClassifier:
     @staticmethod
     def _compute_mse(roi1, roi2):
         if roi1 is None or roi2 is None or roi1.shape != roi2.shape:
-            return 999.0
+            return 0.0  # 无法比较时返回 0（无运动），而非 999（假阳性最大运动）
         diff = cv2.absdiff(roi1, roi2)
         return float(np.mean(diff.astype(np.float32) ** 2))
 
-    def _static_buffer_check(self, gray, flow_data):
-        """基于自适应与光流方向的全面得分评估"""
+    def _static_buffer_check(self, gray, flow_data, frame_w: int = 640):
+        """基于自适应阈值（百分位）与区域化光流方向一致性的全面得分评估"""
         left_roi, right_roi, center_roi = self._extract_rois(gray)
 
         if self.prev_left_roi is None:
@@ -130,15 +150,19 @@ class ViewClassifier:
         if self.frame_count % self.check_interval != 0:
             return self.latest_fw_score, self.latest_sw_score
 
-        # --- 问题1: 动态自适应阈值 ---
+        # --- 优化1: 自适应阈值 — 使用近N帧全局MSE的75百分位（适应夜间/隧道） ---
         global_diff = cv2.absdiff(gray, self.prev_gray)
         global_mse = float(np.mean(global_diff.astype(np.float32) ** 2))
         self.prev_gray = gray.copy()
-        
+
         self.global_mse_history.append(global_mse)
-        # 以全局抖动的平均值向上放宽，防止颠簸造成的全局变亮/模糊
-        dynamic_thresh = self.mse_base_threshold + 0.4 * np.mean(self.global_mse_history)
-        
+        if len(self.global_mse_history) >= 5:
+            p75 = float(np.percentile(list(self.global_mse_history), 75))
+        else:
+            # 样本不足时用均值 * 1.5 作为保守上界估计
+            p75 = float(np.mean(self.global_mse_history)) * 1.5
+        dynamic_thresh = self.mse_base_threshold + 0.4 * p75
+
         self.left_mse = self._compute_mse(left_roi, self.prev_left_roi)
         self.right_mse = self._compute_mse(right_roi, self.prev_right_roi)
         self.center_mse = self._compute_mse(center_roi, self.prev_center_roi)
@@ -147,17 +171,17 @@ class ViewClassifier:
         self.prev_right_roi = right_roi.copy()
         self.prev_center_roi = center_roi.copy()
 
-        # --- 问题2: 滑动均值缓解闪烁 ---
+        # --- 优化2: 窗口均值（maxlen=5）消除单帧抖动 ---
         self.left_mse_history.append(self.left_mse)
         self.right_mse_history.append(self.right_mse)
-        
-        avg_left_mse = np.mean(self.left_mse_history)
-        avg_right_mse = np.mean(self.right_mse_history)
+
+        avg_left_mse = float(np.mean(self.left_mse_history))
+        avg_right_mse = float(np.mean(self.right_mse_history))
 
         self.left_static = avg_left_mse < dynamic_thresh
         self.right_static = avg_right_mse < dynamic_thresh
         self.center_moving = self.center_mse > self.center_motion_base
-        
+
         if self.left_static and self.right_static:
             self.side_anchor = "left" if avg_left_mse < avg_right_mse else "right"
         elif self.left_static:
@@ -165,84 +189,143 @@ class ViewClassifier:
         elif self.right_static:
             self.side_anchor = "right"
 
-        # --- 问题3 & 5: 分区光流方向与特征加分 ---
-        flow_dx_abs = []
-        flow_dy_abs = []
+        # --- 优化3: 按屏幕区域（左/中/右）分组光流，计算方向一致性置信度 ---
+        fw = max(1, frame_w)
+        left_bound = fw * 0.40
+        right_bound = fw * 0.60
+
+        lr_dx, lr_dy = [], []   # 左侧区域
+        cr_dx, cr_dy = [], []   # 中央区域
+        rr_dx, rr_dy = [], []   # 右侧区域
+
         for (cx, cy, dx, dy) in flow_data:
-            flow_dx_abs.append(abs(dx))
-            flow_dy_abs.append(abs(dy))
-            
-        dx_mean = np.mean(flow_dx_abs) if flow_dx_abs else 0.0
-        dy_mean = np.mean(flow_dy_abs) if flow_dy_abs else 0.0
-        total_flow = dx_mean + dy_mean + 1e-5
-        
-        dx_ratio = dx_mean / total_flow
-        dy_ratio = dy_mean / total_flow
-        
+            adx, ady = abs(dx), abs(dy)
+            if cx < left_bound:
+                lr_dx.append(adx); lr_dy.append(ady)
+            elif cx > right_bound:
+                rr_dx.append(adx); rr_dy.append(ady)
+            else:
+                cr_dx.append(adx); cr_dy.append(ady)
+
+        def _region_lateral_fwd(dx_list, dy_list):
+            """返回该区域的 (横向主导度, 纵向主导度) ∈ [0,1]，按幅度加权"""
+            if dx_list:
+                weights = [abs(d) + 1e-6 for d in dx_list]
+                wt = sum(weights)
+                dm = sum(abs(d) * w for d, w in zip(dx_list, weights)) / wt
+            else:
+                dm = 0.0
+            if dy_list:
+                weights_y = [abs(d) + 1e-6 for d in dy_list]
+                wt_y = sum(weights_y)
+                dym = sum(abs(d) * w for d, w in zip(dy_list, weights_y)) / wt_y
+            else:
+                dym = 0.0
+            total = dm + dym + 1e-5
+            return dm / total, dym / total
+
+        ll, lf = _region_lateral_fwd(lr_dx, lr_dy)
+        cl, cf = _region_lateral_fwd(cr_dx, cr_dy)
+        rl, rf = _region_lateral_fwd(rr_dx, rr_dy)
+
+        # 侧面一致性：边缘区域横向主导得分更高（可配置权重）
+        ew = self.edge_flow_weight
+        cw = self.center_flow_weight
+        has_edge_flow = bool(lr_dx or rr_dx or cr_dx)
+        if has_edge_flow:
+            side_flow_score = (ll * ew + rl * ew + cl * cw) / 3.0
+        else:
+            side_flow_score = 0.0
+
+        # 前向一致性：中央区域纵向主导，边缘横向会压制前向得分
+        has_center_flow = bool(cr_dx or cr_dy)
+        if has_center_flow:
+            fwd_flow_score = max(0.0, (cf * 1.5 - (ll + rl) * 0.25) / 1.5)
+        else:
+            fwd_flow_score = 0.0
+
         side_evidence = 0.0
         front_evidence = 0.0
-        
-        # 1) 边缘静止提供原生证据
+
+        # 1) 边缘静止提供原生侧面证据（可配置基础权重）
         if (self.left_static or self.right_static) and self.center_moving:
-            side_evidence += 0.4
+            side_evidence += self.side_evidence_base
         if not self.left_static and not self.right_static:
             front_evidence += 0.3
-            
-        # 2) 光流一致性得分提权
-        if dx_ratio > 0.65 and dx_mean > 2.0:
-            side_evidence += 0.6 * ((dx_ratio - 0.5) * 2)
-        if dy_ratio > 0.6 and dy_mean > 1.0:
-            front_evidence += 0.7 * ((dy_ratio - 0.5) * 2)
-            
+
+        # 2) 区域化光流一致性提权（可配置融合因子）
+        if flow_data:
+            side_evidence += self.flow_side_factor * side_flow_score
+            front_evidence += self.flow_front_factor * fwd_flow_score
+
+            # --- 优化5: 纵向运动占比作为连续前向得分项 ---
+            all_dy = [abs(dy) for (_, _, _, dy) in flow_data]
+            all_dx = [abs(dx) for (_, _, dx, _) in flow_data]
+            g_dy = sum(all_dy) / len(all_dy) if all_dy else 0.0
+            g_dx = sum(all_dx) / len(all_dx) if all_dx else 0.0
+            longitudinal_ratio = g_dy / (g_dy + g_dx + 1e-5)
+            if longitudinal_ratio > 0.55 and g_dy > 1.0:
+                front_evidence += 0.3 * ((longitudinal_ratio - 0.5) * 2.0)
+
         self.latest_fw_score = min(1.0, max(0.0, front_evidence))
         self.latest_sw_score = min(1.0, max(0.0, side_evidence))
-        
+
         return self.latest_fw_score, self.latest_sw_score
 
     def _state_locker(self, fw_score, sw_score):
-        """基于双向自适应置信度滞回机制的状态机 (问题4)"""
+        """基于双向自适应置信度滞回机制的状态机（拆分计数器 + 最小驻留时间）"""
         if self.locked:
             return self.locked_perspective
 
         # EMA 更新整体打分趋势
         self.current_forward_score = 0.8 * self.current_forward_score + 0.2 * fw_score
         self.current_side_score = 0.8 * self.current_side_score + 0.2 * sw_score
-        
-        # 平滑后再进行一轮 softmax 感的归一化，使得相加为 1.0 (不强求也可)
+
         total = self.current_forward_score + self.current_side_score + 1e-5
         fw_conf = self.current_forward_score / total
         sw_conf = self.current_side_score / total
 
         if self.current_view == "分析中...":
             self.current_view = "前向视角"
+            self._last_view = self.current_view
+
+        # 最小驻留帧数：切换后必须停留 N 帧才允许再次切换
+        self._dwell_counter += 1
 
         confidence_gap = abs(sw_conf - fw_conf)
-        # 高置信度可以极大缩短确认所需的时间帧数
-        scale_factor = max(0.3, 1.0 - 0.7 * confidence_gap)  
-        
+        scale_factor = max(0.3, 1.0 - 0.7 * confidence_gap)
+
         req_confirm = max(2, int(self.confirm_frames * scale_factor))
         req_unlock = max(4, int(self.unlock_frames * scale_factor))
 
         if sw_conf > fw_conf and sw_conf > 0.55:
             # 倾向侧面
+            self._front_return_count = 0  # 重置前向回退计数
             if self.current_view == "侧面视角":
-                self.side_lock_counter = 0
+                self._side_confirm_count = 0
             else:
-                self.side_lock_counter += 1
-                if self.side_lock_counter >= req_confirm:
+                self._side_confirm_count += 1
+                if self._side_confirm_count >= req_confirm and self._dwell_counter >= self.min_dwell_frames:
                     self.current_view = "侧面视角"
-                    self.logger.warning(f"切换至侧向视角 (短切所需帧: {req_confirm}, gap: {confidence_gap:.2f})")
+                    self._dwell_counter = 0
+                    self._side_confirm_count = 0
+                    self.logger.warning(f"切换至侧向视角 (确认帧: {req_confirm}, gap: {confidence_gap:.2f})")
         elif fw_conf > sw_conf and fw_conf > 0.55:
             # 倾向前方
+            self._side_confirm_count = 0  # 重置侧面确认计数
             if self.current_view == "侧面视角":
-                self.side_lock_counter += 1 # 反向借用计数器做退回累积
-                if self.side_lock_counter >= req_unlock:
+                self._front_return_count += 1
+                if self._front_return_count >= req_unlock and self._dwell_counter >= self.min_dwell_frames:
                     self.current_view = "前向视角"
-                    self.side_lock_counter = 0
-                    self.logger.info(f"切回前向视角 (解锁所需帧: {req_unlock})")
+                    self._dwell_counter = 0
+                    self._front_return_count = 0
+                    self.logger.info(f"切回前向视角 (解锁帧: {req_unlock})")
             else:
                 self.current_view = "前向视角"
-                self.side_lock_counter = 0
+                self._front_return_count = 0
+
+        # 向后兼容：合并计数器到 side_lock_counter 供调试面板
+        self.side_lock_counter = self._side_confirm_count + self._front_return_count
 
     def analyze_frame(self, frame, detections=None):
         if self.locked:
@@ -263,7 +346,10 @@ class ViewClassifier:
         if gray is None:
             return 0.5, 0.5
 
-        flow_data = [] 
+        # 获取原始帧宽度，用于区域光流分析
+        frame_h_orig, frame_w_orig = frame.shape[:2]
+
+        flow_data = []
         if detections:
             current_ids = set()
             for rec in detections:
@@ -273,12 +359,18 @@ class ViewClassifier:
                     px, py = self.history_centers[tid]
                     flow_data.append((cx, cy, cx - px, cy - py))
                 self.history_centers[tid] = (cx, cy)
-            
+
             for tid in list(self.history_centers.keys()):
                 if tid not in current_ids:
                     del self.history_centers[tid]
 
-        fw_score, sw_score = self._static_buffer_check(gray, flow_data)
+        # 内存保护：限制跟踪 ID 数量上限
+        if len(self.history_centers) > self.max_tracked_ids:
+            excess = len(self.history_centers) - self.max_tracked_ids
+            for old_id in list(self.history_centers.keys())[:excess]:
+                del self.history_centers[old_id]
+
+        fw_score, sw_score = self._static_buffer_check(gray, flow_data, frame_w_orig)
         self._state_locker(fw_score, sw_score)
 
         # 发送连续值！由当前时延平滑的结果为准。
